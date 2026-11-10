@@ -66,6 +66,31 @@ static VAStatus image_setup_layout(VAImage *image, uint32_t fourcc,
 	return VA_STATUS_SUCCESS;
 }
 
+/*
+ * The bytes a region width wide takes in a row of each plane, bounded by both
+ * pitches. A chroma row of NV12 or P010 holds a Cb and a Cr sample for each
+ * two luma columns, an odd width's last column included: when the width is
+ * odd, it is one sample longer than the luma row.
+ */
+static void image_row_sizes(const struct v4l2r_surface *surface,
+			    const VAImage *image, unsigned int width,
+			    unsigned int *luma, unsigned int *chroma)
+{
+	unsigned int sample = surface->info->va_fourcc == VA_FOURCC_P010 ? 2 : 1;
+
+	*luma = width * sample;
+	if (*luma > image->pitches[0])
+		*luma = image->pitches[0];
+	if (*luma > surface->pitch)
+		*luma = surface->pitch;
+
+	*chroma = (width + 1) / 2 * 2 * sample;
+	if (*chroma > image->pitches[1])
+		*chroma = image->pitches[1];
+	if (*chroma > surface->pitch)
+		*chroma = surface->pitch;
+}
+
 VAStatus v4l2r_CreateImage(VADriverContextP va_ctx, VAImageFormat *format,
 			   int width, int height, VAImage *image)
 {
@@ -253,7 +278,7 @@ VAStatus v4l2r_GetImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 	VAStatus status;
 	const uint8_t *src_luma, *src_chroma;
 	uint8_t *dst;
-	unsigned int row_size;
+	unsigned int luma_row, chroma_row;
 
 	surface = V4L2R_SURFACE_GET(drv, surface_id);
 	image_object = V4L2R_IMAGE_GET(drv, image_id);
@@ -300,16 +325,10 @@ VAStatus v4l2r_GetImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 
 	dst = buffer->data;
 
-	row_size = width;
-	if (surface->info->va_fourcc == VA_FOURCC_P010)
-		row_size *= 2;
-	if (row_size > image->pitches[0])
-		row_size = image->pitches[0];
-	if (row_size > surface->pitch)
-		row_size = surface->pitch;
+	image_row_sizes(surface, image, width, &luma_row, &chroma_row);
 
 	/* Full rows with matching pitches: copy each plane in one go. */
-	if (row_size == surface->pitch && image->pitches[0] == surface->pitch &&
+	if (luma_row == surface->pitch && image->pitches[0] == surface->pitch &&
 	    image->pitches[1] == surface->pitch) {
 		memcpy(dst + image->offsets[0], src_luma,
 		       (size_t)surface->pitch * height);
@@ -320,11 +339,11 @@ VAStatus v4l2r_GetImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 
 	for (unsigned int i = 0; i < height; i++)
 		memcpy(dst + image->offsets[0] + i * image->pitches[0],
-		       src_luma + i * surface->pitch, row_size);
+		       src_luma + i * surface->pitch, luma_row);
 
 	for (unsigned int i = 0; i < (height + 1) / 2; i++)
 		memcpy(dst + image->offsets[1] + i * image->pitches[1],
-		       src_chroma + i * surface->pitch, row_size);
+		       src_chroma + i * surface->pitch, chroma_row);
 
 	return VA_STATUS_SUCCESS;
 }
@@ -345,7 +364,7 @@ VAStatus v4l2r_PutImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 	const uint8_t *src;
 	unsigned int width = dest_width;
 	unsigned int height = dest_height;
-	unsigned int row_size;
+	unsigned int luma_row, chroma_row;
 
 	surface = V4L2R_SURFACE_GET(drv, surface_id);
 	image_object = V4L2R_IMAGE_GET(drv, image_id);
@@ -395,16 +414,10 @@ VAStatus v4l2r_PutImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 
 	src = buffer->data;
 
-	row_size = width;
-	if (surface->info->va_fourcc == VA_FOURCC_P010)
-		row_size *= 2;
-	if (row_size > image->pitches[0])
-		row_size = image->pitches[0];
-	if (row_size > surface->pitch)
-		row_size = surface->pitch;
+	image_row_sizes(surface, image, width, &luma_row, &chroma_row);
 
 	/* Full rows with matching pitches: copy each plane in one go. */
-	if (row_size == surface->pitch && image->pitches[0] == surface->pitch &&
+	if (luma_row == surface->pitch && image->pitches[0] == surface->pitch &&
 	    image->pitches[1] == surface->pitch) {
 		memcpy(dst_luma, src + image->offsets[0],
 		       (size_t)surface->pitch * height);
@@ -416,12 +429,12 @@ VAStatus v4l2r_PutImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 	for (unsigned int i = 0; i < height; i++)
 		memcpy(dst_luma + i * surface->pitch,
 		       src + image->offsets[0] + i * image->pitches[0],
-		       row_size);
+		       luma_row);
 
 	for (unsigned int i = 0; i < (height + 1) / 2; i++)
 		memcpy(dst_chroma + i * surface->pitch,
 		       src + image->offsets[1] + i * image->pitches[1],
-		       row_size);
+		       chroma_row);
 
 	return VA_STATUS_SUCCESS;
 }
