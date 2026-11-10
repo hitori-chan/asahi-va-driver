@@ -450,6 +450,7 @@ static VAStatus queue_decode(struct v4l2r_context *ctx,
 {
 	struct v4l2r_output_buffer *output = ctx->pic.output;
 	struct v4l2r_surface *target = ctx->pic.target;
+	bool attached = false;
 	uint32_t flags;
 	int ret;
 
@@ -488,6 +489,7 @@ static VAStatus queue_decode(struct v4l2r_context *ctx,
 			  output->index, strerror(-ret));
 		goto fail;
 	}
+	attached = true;
 
 	if (first_slice) {
 		/* Queue the specific CAPTURE buffer tied to the target
@@ -512,11 +514,6 @@ static VAStatus queue_decode(struct v4l2r_context *ctx,
 		ret = -errno;
 		v4l2r_log("failed to queue request %d: %s\n",
 			  output->request_fd, strerror(errno));
-		/* The OUTPUT buffer stays bound to the still-idle request and
-		 * will never be dequeued; the REINIT in wait_on_request()
-		 * releases it when the ring comes back around, so waiting for
-		 * a dequeue would only stall next_output(). */
-		ctx->queued_output &= ~(1u << output->index);
 		goto fail;
 	}
 
@@ -527,6 +524,12 @@ static VAStatus queue_decode(struct v4l2r_context *ctx,
 	return VA_STATUS_SUCCESS;
 
 fail:
+	/* A queued OUTPUT buffer stays bound to the still-idle request and
+	 * will never be dequeued; the REINIT in wait_on_request() releases
+	 * it when the ring comes back around, so waiting for a dequeue would
+	 * only stall next_output(). */
+	if (attached)
+		ctx->queued_output &= ~(1u << output->index);
 	pthread_mutex_unlock(&ctx->mutex);
 	return VA_STATUS_ERROR_OPERATION_FAILED;
 }
