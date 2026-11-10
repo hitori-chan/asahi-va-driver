@@ -291,7 +291,8 @@ static int try_format(int fd, struct v4l2_format *out,
 
 static int surface_alloc(struct v4l2r_decoder *dec,
 			 struct v4l2r_surface *surface,
-			 struct v4l2_format *ctx_cap,
+			 const struct v4l2_format *ctx_out,
+			 const struct v4l2_format *ctx_cap,
 			 uint32_t pixfmt)
 {
 	struct v4l2_capability capability = {0};
@@ -342,6 +343,19 @@ static int surface_alloc(struct v4l2r_decoder *dec,
 		cap.fmt.pix_mp.plane_fmt[0].sizeimage +=
 			cap.fmt.pix_mp.plane_fmt[0].sizeimage / 2;
 	} else {
+		/*
+		 * CREATE_BUFS checks the size asked for against the queue's own
+		 * CAPTURE format, and a fresh instance has the decoder's default:
+		 * its first codec at the smallest size. A context whose buffers
+		 * are smaller than that (AVD: VP9 at 64x64, which keeps no
+		 * reference data after the picture, against HEVC's default) got
+		 * EINVAL and no backing. Give the instance the context's coded
+		 * format first: its own CAPTURE format is then the context's
+		 * picture at the 8-bit default, never larger than the context's.
+		 */
+		out = *ctx_out;
+		if (ioctl(fd, VIDIOC_S_FMT, &out) < 0)
+			goto done;
 		cap = *ctx_cap;
 	}
 
@@ -419,7 +433,7 @@ static int surface_allocate(struct v4l2r_driver *drv,
 		struct v4l2_format *cap = &ctx->capture_format;
 
 		dec = (struct v4l2r_decoder *)surface->ctx->decoder;
-		if (surface_alloc(dec, surface, cap,
+		if (surface_alloc(dec, surface, &ctx->output_format, cap,
 				  cap->fmt.pix_mp.pixelformat))
 			return 1;
 	} else {
@@ -430,7 +444,7 @@ static int surface_allocate(struct v4l2r_driver *drv,
 
 		for (unsigned int i = 0; i < drv->nb_decoders; i++) {
 			dec = &drv->decoders[i];
-			if (surface_alloc(dec, surface, NULL, pixfmt))
+			if (surface_alloc(dec, surface, NULL, NULL, pixfmt))
 				continue;
 			else
 				goto done;
