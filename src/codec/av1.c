@@ -594,9 +594,8 @@ static void av1_uninit(struct v4l2r_context *ctx)
 {
 	struct av1_context *codec = ctx->codec_priv;
 
-	/* The video/media fds are already closed by the time uninit runs, so a
-	 * frame still held for deferral cannot be submitted here; drop it. Any
-	 * frame the client actually read was flushed via v4l2r_flush_surface(). */
+	/* DestroyContext submitted a frame still held for deferral before it
+	 * closed the video and media fds. */
 	free(codec->tiles);
 	free(codec->va_slices);
 	free(codec->pend_tiles);
