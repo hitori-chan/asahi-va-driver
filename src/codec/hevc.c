@@ -48,6 +48,7 @@ struct hevc_slice_info {
 	uint32_t long_term_ref_pic_set_size;
 	uint32_t num_delta_pocs_of_ref_rps_idx;
 	uint32_t num_entry_point_offsets; /* vaapi always sets this to 0 */
+	bool entry_points_dropped;	/* more than the control holds */
 	bool valid;
 };
 
@@ -100,15 +101,17 @@ static void ref_pic_lists_modification(struct hevc_context *codec,
 			struct v4l2r_bits *b, uint32_t num_ref_idx_l0_active_minus1,
 			uint32_t num_ref_idx_l1_active_minus1, bool slice_type_b)
 {
-	if(v4l2r_bits_bit(b)) {	/* ref_pic_list_modification_flag_l0 */
+	/* list_entry_lX[i] is u(v) of Ceil(Log2(NumPicTotalCurr)) bits */
+	unsigned int entry_bits = ceil_log2(codec->num_pic_total_curr);
+
+	if (v4l2r_bits_bit(b))	/* ref_pic_list_modification_flag_l0 */
 		for (uint32_t i = 0; i <= num_ref_idx_l0_active_minus1; i++)
-			v4l2r_bits_read(b, codec->num_pic_total_curr);	/* list_entry_l0[i] */
-		if (slice_type_b &&
-				v4l2r_bits_bit(b))	/* ref_pic_list_modification_flag_l1 */
-			for (uint32_t i = 0; i <= num_ref_idx_l1_active_minus1; i++)
-				/* list_entry_l1[i] */
-				v4l2r_bits_read(b, codec->num_pic_total_curr);
-	}
+			v4l2r_bits_read(b, entry_bits);	/* list_entry_l0[i] */
+
+	/* A B slice carries flag_l1 whatever flag_l0 was. */
+	if (slice_type_b && v4l2r_bits_bit(b))	/* ref_pic_list_modification_flag_l1 */
+		for (uint32_t i = 0; i <= num_ref_idx_l1_active_minus1; i++)
+			v4l2r_bits_read(b, entry_bits);	/* list_entry_l1[i] */
 }
 
 /* generalised 7.3.6.3 Weighted prediction parameters syntax */
@@ -116,8 +119,14 @@ static void pred_weight_table(struct v4l2r_bits *b,
 			uint32_t num_ref_idx_active_minus1,
 			uint32_t chroma_array_type)
 {
-	uint8_t luma_weight_flag[num_ref_idx_active_minus1 + 1];
-	uint8_t chroma_weight_flag[num_ref_idx_active_minus1 + 1];
+	uint8_t luma_weight_flag[15];
+	uint8_t chroma_weight_flag[15];
+
+	/* 7.4.7.1: at most 15 active references */
+	if (num_ref_idx_active_minus1 > 14) {
+		b->error = true;
+		return;
+	}
 
 	for (uint32_t i = 0; i <= num_ref_idx_active_minus1; i++)
 		luma_weight_flag[i] = v4l2r_bits_bit(b);	/* luma_weight_lX_flag[i] */
@@ -152,11 +161,16 @@ static void hevc_parse_slice_header(struct hevc_context *codec,
 	bool first_slice_in_pic, dependent_slice = false;
 	bool slice_temporal_mvp_enabled_flag = false;
 	bool slice_sao_luma_flag = false, slice_sao_chroma_flag = false;
-	bool slice_deblocking_filter_disabled_flag = false;
-	bool collocated_from_l0_flag = false;
+	/* Syntax elements a slice header leaves out take the values 7.4.7.1
+	 * infers for them: the PPS's deblocking state and reference counts,
+	 * and collocation from list 0. */
+	bool slice_deblocking_filter_disabled_flag =
+		pic->slice_parsing_fields.bits.pps_disable_deblocking_filter_flag;
+	bool collocated_from_l0_flag = true;
 	uint32_t chroma_array_type, slice_type;
 	uint32_t offset_len_minus1;
-	uint32_t num_ref_idx_l0_active_minus1 = 0, num_ref_idx_l1_active_minus1 = 0;
+	uint32_t num_ref_idx_l0_active_minus1 = pic->num_ref_idx_l0_default_active_minus1;
+	uint32_t num_ref_idx_l1_active_minus1 = pic->num_ref_idx_l1_default_active_minus1;
 	bool idr, irap;
 	struct v4l2r_bits b;
 	size_t mark;
@@ -311,6 +325,12 @@ static void hevc_parse_slice_header(struct hevc_context *codec,
 				if (slice_type == V4L2_HEVC_SLICE_TYPE_B)
 					num_ref_idx_l1_active_minus1 = v4l2r_bits_ue(&b);
 			}
+			/* 7.4.7.1: at most 15 active references */
+			if (num_ref_idx_l0_active_minus1 > 14 ||
+			    num_ref_idx_l1_active_minus1 > 14) {
+				b.error = true;
+				goto done;
+			}
 			if (pic->slice_parsing_fields.bits.lists_modification_present_flag &&
 					codec->num_pic_total_curr > 1) {
 				ref_pic_lists_modification(codec, &b,
@@ -325,10 +345,12 @@ static void hevc_parse_slice_header(struct hevc_context *codec,
 			if (slice_temporal_mvp_enabled_flag) {
 				if (slice_type == V4L2_HEVC_SLICE_TYPE_B)
 					collocated_from_l0_flag = v4l2r_bits_bit(&b);
+				/* Present when the slice's own list, overridden
+				 * or not, holds more than one picture. */
 				if ((collocated_from_l0_flag &&
-						pic->num_ref_idx_l0_default_active_minus1 > 0)
+						num_ref_idx_l0_active_minus1 > 0)
 						|| (!collocated_from_l0_flag &&
-						pic->num_ref_idx_l1_default_active_minus1 > 0))
+						num_ref_idx_l1_active_minus1 > 0))
 					v4l2r_bits_ue(&b);	/* collocated_ref_idx */
 			}
 			if ((pic->pic_fields.bits.weighted_pred_flag &&
@@ -378,18 +400,23 @@ static void hevc_parse_slice_header(struct hevc_context *codec,
 			pic->pic_fields.bits.entropy_coding_sync_enabled_flag) {
 		info->num_entry_point_offsets = v4l2r_bits_ue(&b);
 
-		if (info->num_entry_point_offsets > 0 &&
-				info->num_entry_point_offsets < codec->max_entry_point_offsets
-				&& codec->num_entry_point_offsets +
-				info->num_entry_point_offsets < codec->max_entry_point_offsets) {
+		/* The picture's offsets share one control of
+		 * max_entry_point_offsets elements. */
+		if (info->num_entry_point_offsets > codec->max_entry_point_offsets -
+		    codec->num_entry_point_offsets) {
+			info->num_entry_point_offsets = 0;
+			info->entry_points_dropped = true;
+		} else if (info->num_entry_point_offsets > 0) {
 			offset_len_minus1 = v4l2r_bits_ue(&b);
-			offset_len_minus1 = offset_len_minus1 > 31 ? 31 : offset_len_minus1;
+			if (offset_len_minus1 > 31) {
+				info->num_entry_point_offsets = 0;
+				b.error = true;
+				goto done;
+			}
 			for (uint32_t i = 0; i < info->num_entry_point_offsets; i++) {
 				codec->entry_point_offsets[codec->num_entry_point_offsets++]
 					= v4l2r_bits_read(&b, offset_len_minus1 + 1) + 1;
 			}
-		} else {
-			info->num_entry_point_offsets = 0;
 		}
 	}
 
@@ -863,6 +890,20 @@ static VAStatus hevc_process_slice(struct v4l2r_context *ctx,
 
 	hevc_parse_slice_header(codec, slice_data, va_slice->slice_data_size,
 				&info);
+
+	/*
+	 * With tiles the decoder splits the slice data at the entry points
+	 * recovered above. Without them it decodes the tiles from the wrong
+	 * bytes: AVD reports an error and stalls until its watchdog resets
+	 * it, so refuse the slice instead.
+	 */
+	if (codec->max_entry_point_offsets &&
+	    codec->va_pic.pic_fields.bits.tiles_enabled_flag &&
+	    (!info.valid || info.entry_points_dropped)) {
+		v4l2r_log("hevc: slice header entry points could not be "
+			  "recovered\n");
+		return VA_STATUS_ERROR_INVALID_BUFFER;
+	}
 
 	if (codec->num_slices == 0 && info.valid) {
 		codec->decode_params.short_term_ref_pic_set_size =
