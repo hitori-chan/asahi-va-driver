@@ -612,6 +612,7 @@ static VAStatus h264_process_slice(struct v4l2r_context *ctx,
 	struct h264_context *codec = ctx->codec_priv;
 	const uint8_t *slice_data = data + va_slice->slice_data_offset;
 	struct h264_slice_info info;
+	size_t slice_size;
 	VAStatus status;
 
 	if (!codec->have_pic)
@@ -622,6 +623,17 @@ static VAStatus h264_process_slice(struct v4l2r_context *ctx,
 	if (va_slice->slice_data_offset > data_size ||
 	    va_slice->slice_data_size > data_size - va_slice->slice_data_offset)
 		return VA_STATUS_ERROR_INVALID_BUFFER;
+
+	/*
+	 * A NAL unit never ends in a zero byte (7.4.1): zero bytes after its
+	 * last one are the byte stream's, such as the zero_byte of a following
+	 * 4-byte start code, which FFmpeg leaves on its slice data. The decoder
+	 * takes the OUTPUT payload's end as the slice data's end; AVD fails a
+	 * CAVLC slice that carries the zero byte (H4 error, then its watchdog).
+	 */
+	slice_size = va_slice->slice_data_size;
+	while (slice_size > 1 && slice_data[slice_size - 1] == 0x00)
+		slice_size--;
 
 	/* In slice mode every slice becomes its own request; flush the
 	 * previously staged one before starting the next. */
@@ -709,7 +721,7 @@ static VAStatus h264_process_slice(struct v4l2r_context *ctx,
 			return status;
 	}
 
-	status = v4l2r_append_output(ctx, slice_data, va_slice->slice_data_size);
+	status = v4l2r_append_output(ctx, slice_data, slice_size);
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 
