@@ -513,9 +513,14 @@ void v4l2r_context_release_capture(struct v4l2r_context *ctx, int index)
 
 void v4l2r_flush_surface(struct v4l2r_surface *surface)
 {
-	if (surface && surface->ctx && surface->ctx->codec &&
-	    surface->ctx->codec->flush)
-		surface->ctx->codec->flush(surface->ctx, surface);
+	struct v4l2r_context *ctx = surface ? surface->ctx : NULL;
+
+	if (!ctx || !ctx->codec || !ctx->codec->flush)
+		return;
+
+	pthread_mutex_lock(&ctx->picture_mutex);
+	ctx->codec->flush(ctx, surface);
+	pthread_mutex_unlock(&ctx->picture_mutex);
 }
 
 VAStatus v4l2r_context_bind_surface(struct v4l2r_context *ctx,
@@ -618,6 +623,7 @@ VAStatus v4l2r_CreateContext(VADriverContextP va_ctx, VAConfigID config_id,
 	ctx->video_fd = -1;
 	ctx->media_fd = -1;
 	pthread_mutex_init(&ctx->mutex, NULL);
+	pthread_mutex_init(&ctx->picture_mutex, NULL);
 	for (unsigned int i = 0; i < V4L2R_OUTPUT_BUFFERS; i++)
 		ctx->output[i].request_fd = -1;
 
@@ -829,6 +835,7 @@ VAStatus v4l2r_DestroyContext(VADriverContextP va_ctx, VAContextID context_id)
 		ctx->codec->uninit(ctx);
 	free(ctx->codec_priv);
 	pthread_mutex_destroy(&ctx->mutex);
+	pthread_mutex_destroy(&ctx->picture_mutex);
 
 	pthread_mutex_lock(&drv->mutex);
 	v4l2r_handles_free(&drv->contexts, context_id);
@@ -857,19 +864,25 @@ VAStatus v4l2r_BeginPicture(VADriverContextP va_ctx, VAContextID context_id,
 	if (surface->ctx && surface->ctx != ctx)
 		return VA_STATUS_ERROR_SURFACE_BUSY;
 
-	if (ctx->vpp)
-		return v4l2r_vpp_begin_picture(ctx, surface);
+	pthread_mutex_lock(&ctx->picture_mutex);
+
+	if (ctx->vpp) {
+		status = v4l2r_vpp_begin_picture(ctx, surface);
+		goto done;
+	}
 
 	status = v4l2r_picture_begin(ctx, surface);
 	if (status != VA_STATUS_SUCCESS)
-		return status;
+		goto done;
 
 	ctx->in_picture = true;
 
 	if (ctx->codec->begin_picture)
-		return ctx->codec->begin_picture(ctx);
+		status = ctx->codec->begin_picture(ctx);
 
-	return VA_STATUS_SUCCESS;
+done:
+	pthread_mutex_unlock(&ctx->picture_mutex);
+	return status;
 }
 
 VAStatus v4l2r_RenderPicture(VADriverContextP va_ctx, VAContextID context_id,
@@ -877,28 +890,37 @@ VAStatus v4l2r_RenderPicture(VADriverContextP va_ctx, VAContextID context_id,
 {
 	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
 	struct v4l2r_context *ctx;
-	VAStatus status;
+	VAStatus status = VA_STATUS_SUCCESS;
 
 	ctx = V4L2R_CONTEXT_GET(drv, context_id);
 	if (!ctx)
 		return VA_STATUS_ERROR_INVALID_CONTEXT;
-	if (!ctx->in_picture)
-		return VA_STATUS_ERROR_OPERATION_FAILED;
+
+	pthread_mutex_lock(&ctx->picture_mutex);
+
+	if (!ctx->in_picture) {
+		status = VA_STATUS_ERROR_OPERATION_FAILED;
+		goto done;
+	}
 
 	for (int i = 0; i < num_buffers; i++) {
 		struct v4l2r_buffer *buffer;
 
 		buffer = V4L2R_BUFFER_GET(drv, buffers[i]);
-		if (!buffer)
-			return VA_STATUS_ERROR_INVALID_BUFFER;
+		if (!buffer) {
+			status = VA_STATUS_ERROR_INVALID_BUFFER;
+			break;
+		}
 
 		status = ctx->vpp ? v4l2r_vpp_render_buffer(ctx, buffer) :
 			 ctx->codec->render_buffer(ctx, buffer);
 		if (status != VA_STATUS_SUCCESS)
-			return status;
+			break;
 	}
 
-	return VA_STATUS_SUCCESS;
+done:
+	pthread_mutex_unlock(&ctx->picture_mutex);
+	return status;
 }
 
 VAStatus v4l2r_EndPicture(VADriverContextP va_ctx, VAContextID context_id)
@@ -910,8 +932,13 @@ VAStatus v4l2r_EndPicture(VADriverContextP va_ctx, VAContextID context_id)
 	ctx = V4L2R_CONTEXT_GET(drv, context_id);
 	if (!ctx)
 		return VA_STATUS_ERROR_INVALID_CONTEXT;
-	if (!ctx->in_picture)
+
+	pthread_mutex_lock(&ctx->picture_mutex);
+
+	if (!ctx->in_picture) {
+		pthread_mutex_unlock(&ctx->picture_mutex);
 		return VA_STATUS_ERROR_OPERATION_FAILED;
+	}
 
 	status = ctx->vpp ? v4l2r_vpp_end_picture(ctx) :
 		 ctx->codec->end_picture(ctx);
@@ -920,5 +947,6 @@ VAStatus v4l2r_EndPicture(VADriverContextP va_ctx, VAContextID context_id)
 	ctx->pic.output = NULL;
 	ctx->pic.target = NULL;
 
+	pthread_mutex_unlock(&ctx->picture_mutex);
 	return status;
 }

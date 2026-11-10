@@ -269,6 +269,12 @@ struct v4l2r_context {
 
 	struct v4l2r_picture pic;
 	bool in_picture;
+	/* Serialises the picture entrypoints with codec->flush(). A sync or
+	 * read of a held surface flushes it from the caller's thread (FFmpeg
+	 * downloads frames on its filter thread while its decoder thread
+	 * renders the next one), and the flush borrows pic and the codec
+	 * state to submit the held frame. Taken before mutex. */
+	pthread_mutex_t picture_mutex;
 
 	/* Video processing state for VAEntrypointVideoProc contexts; such
 	 * contexts have no codec, decoder device or queues. See convert.c. */
