@@ -801,6 +801,18 @@ VAStatus v4l2r_DestroyContext(VADriverContextP va_ctx, VAContextID context_id)
 	if (!ctx)
 		return VA_STATUS_ERROR_INVALID_CONTEXT;
 
+	/*
+	 * A frame the codec still holds back was rendered all the same, and
+	 * its surface outlives the context: a client may read it after this.
+	 * Submit it, so that the wait below decodes it.
+	 */
+	if (ctx->video_fd >= 0 && ctx->codec && ctx->codec->flush &&
+	    ctx->codec_priv) {
+		pthread_mutex_lock(&ctx->picture_mutex);
+		ctx->codec->flush(ctx, NULL);
+		pthread_mutex_unlock(&ctx->picture_mutex);
+	}
+
 	if (ctx->video_fd >= 0 && ctx->streaming) {
 		v4l2r_wait_completed(ctx, ctx->submitted);
 
