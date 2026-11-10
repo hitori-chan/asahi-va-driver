@@ -130,6 +130,8 @@ VAStatus v4l2r_DestroyBuffer(VADriverContextP va_ctx, VABufferID buf_id)
 	/* Derived image buffers point into the CAPTURE buffer mapping. */
 	if (!buffer->derived)
 		free(buffer->data);
+	else if (buffer->surface)
+		buffer->surface->derived--;
 
 	v4l2r_handles_free(&drv->buffers, buf_id);
 	pthread_mutex_unlock(&drv->mutex);
