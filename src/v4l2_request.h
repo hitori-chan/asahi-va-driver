@@ -170,12 +170,21 @@ struct v4l2r_surface {
 
 	const struct v4l2r_format_info *info;
 
+	/* The client holds the backing: its dma-bufs were exported, or images
+	 * derived from it are alive (driver mutex). It cannot be replaced. */
+	bool exported;
+	unsigned int derived;
+
 	/* Codec scratch, e.g. the AV1 order hint of the decoded frame. */
 	uint32_t codec_tag;
 };
 
 VAStatus v4l2r_surface_prepare(struct v4l2r_driver *drv,
 			       struct v4l2r_surface *surface, bool need_maps);
+/* Drop a backing that cannot be a CAPTURE buffer of this format, so that the
+ * next prepare allocates one that can; -1 when the client holds it. */
+int v4l2r_surface_fit(struct v4l2r_driver *drv, struct v4l2r_surface *surface,
+		      const struct v4l2_format *format);
 
 /* Per CAPTURE buffer state, lives in the context that allocated it. The
  * buffer holds the current decoded content of ->surface, or is free when
@@ -216,6 +225,8 @@ struct v4l2r_buffer {
 	/* Set for images derived from a surface: data points into the
 	 * CAPTURE buffer mapping and must not be freed. */
 	bool derived;
+	/* The surface a derived image maps, NULL once that is destroyed. */
+	struct v4l2r_surface *surface;
 };
 
 struct v4l2r_image {

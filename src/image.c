@@ -204,6 +204,11 @@ VAStatus v4l2r_DeriveImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 	buffer->data = surface->map[0];
 	buffer->derived = true;
 
+	pthread_mutex_lock(&drv->mutex);
+	buffer->surface = surface;
+	surface->derived++;
+	pthread_mutex_unlock(&drv->mutex);
+
 	image->buf = buffer_id;
 	image_object->image = *image;
 

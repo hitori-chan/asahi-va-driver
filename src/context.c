@@ -450,9 +450,11 @@ static int capture_buffer_bind(struct v4l2r_context *ctx,
 
 		/*
 		 * prepare the surface after setting ctx and index so it uses
-		 * the selected pixelformat
+		 * the selected pixelformat, once a backing made for another
+		 * format is dropped
 		 */
-		if (v4l2r_surface_prepare(ctx->drv, surface, false)) {
+		if (v4l2r_surface_fit(ctx->drv, surface, &ctx->capture_format) ||
+		    v4l2r_surface_prepare(ctx->drv, surface, false)) {
 			/* Bound without memory, the buffer could never be
 			 * queued; leave it free for the next surface. */
 			ctx->captures[index].surface = NULL;

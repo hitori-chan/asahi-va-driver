@@ -132,6 +132,16 @@ VAStatus v4l2r_DestroySurfaces(VADriverContextP va_ctx, VASurfaceID *surface_lis
 		surface_unmap(surface);
 
 		pthread_mutex_lock(&drv->mutex);
+		if (surface->derived) {
+			struct v4l2r_buffer *buffer;
+			unsigned int iter = 0;
+
+			/* An image outliving its surface no longer counts. */
+			while ((buffer = v4l2r_handles_next(&drv->buffers,
+							   &iter, NULL)))
+				if (buffer->surface == surface)
+					buffer->surface = NULL;
+		}
 		v4l2r_handles_free(&drv->surfaces, surface_list[i]);
 		pthread_mutex_unlock(&drv->mutex);
 	}
@@ -487,6 +497,55 @@ VAStatus v4l2r_surface_prepare(struct v4l2r_driver *drv,
 }
 
 /*
+ * A backing allocated before the surface met its context was sized for
+ * another format: FFmpeg derives an image from one pool surface before it
+ * creates the context, which allocates that surface against the first coded
+ * format with half again of room, and a surface outlives its context. The
+ * kernel refuses a CAPTURE buffer smaller than its format (AVD keeps AV1's
+ * CDFs and motion vectors after the picture: 22784 bytes at 64x64 against
+ * the 19200 of that backing), and decodes into the context's layout whatever
+ * the backing's own. Drop a backing that does not match, unless the client
+ * holds it.
+ */
+int v4l2r_surface_fit(struct v4l2r_driver *drv, struct v4l2r_surface *surface,
+		      const struct v4l2_format *format)
+{
+	const struct v4l2_pix_format_mplane *pix = &format->fmt.pix_mp;
+	bool fits, held;
+
+	if (!surface->nb_planes)
+		return 0;
+
+	fits = surface->pixelformat == pix->pixelformat &&
+	       surface->nb_planes == pix->num_planes &&
+	       surface->width == pix->width &&
+	       surface->height == pix->height &&
+	       surface->pitch == pix->plane_fmt[0].bytesperline;
+	for (unsigned int i = 0; fits && i < surface->nb_planes; i++)
+		fits = surface->plane_size[i] >= pix->plane_fmt[i].sizeimage;
+	if (fits)
+		return 0;
+
+	pthread_mutex_lock(&drv->mutex);
+	held = surface->exported || surface->derived;
+	pthread_mutex_unlock(&drv->mutex);
+
+	if (held) {
+		v4l2r_log("surface 0x%x: its backing (%ux%u, %u bytes) is not a "
+			  "%ux%u CAPTURE buffer and the client holds it\n",
+			  surface->id, surface->width, surface->height,
+			  surface->plane_size[0], pix->width, pix->height);
+		return -1;
+	}
+
+	v4l2r_trace("surface 0x%x: reallocating its %u byte backing for "
+		    "%ux%u (%u bytes)\n", surface->id, surface->plane_size[0],
+		    pix->width, pix->height, pix->plane_fmt[0].sizeimage);
+	surface_unmap(surface);
+	return 0;
+}
+
+/*
  * Describe the surface memory layout for DRM consumers, following the
  * layout rules of the FFmpeg v4l2-request hwcontext.
  */
@@ -617,7 +676,14 @@ VAStatus v4l2r_ExportSurfaceHandle(VADriverContextP va_ctx, VASurfaceID surface_
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 
-	return fill_prime_descriptor(surface, flags, descriptor);
+	status = fill_prime_descriptor(surface, flags, descriptor);
+	if (status == VA_STATUS_SUCCESS) {
+		pthread_mutex_lock(&drv->mutex);
+		surface->exported = true;
+		pthread_mutex_unlock(&drv->mutex);
+	}
+
+	return status;
 }
 
 /* --- unsupported display path --- */
