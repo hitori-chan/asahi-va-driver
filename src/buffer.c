@@ -13,6 +13,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <linux/dma-buf.h>
+
 #include "v4l2_request.h"
 
 VAStatus v4l2r_CreateBuffer(VADriverContextP va_ctx, VAContextID context_id,
@@ -90,34 +92,15 @@ VAStatus v4l2r_BufferSetNumElements(VADriverContextP va_ctx, VABufferID buf_id,
 	return VA_STATUS_SUCCESS;
 }
 
-VAStatus v4l2r_MapBuffer(VADriverContextP va_ctx, VABufferID buf_id, void **pbuf)
+/*
+ * A derived image's data is the surface's mapped backing: the client reads or
+ * writes it between the first map and the last unmap, which bracket the
+ * CPU's access to a cached backing (v4l2r_surface_cpu_begin()).
+ */
+static VAStatus buffer_map(struct v4l2r_driver *drv, VABufferID buf_id,
+			   void **pbuf, uint64_t access)
 {
-	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
-	struct v4l2r_buffer *buffer;
-
-	buffer = V4L2R_BUFFER_GET(drv, buf_id);
-	if (!buffer)
-		return VA_STATUS_ERROR_INVALID_BUFFER;
-
-	*pbuf = buffer->data;
-	return VA_STATUS_SUCCESS;
-}
-
-VAStatus v4l2r_UnmapBuffer(VADriverContextP va_ctx, VABufferID buf_id)
-{
-	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
-	struct v4l2r_buffer *buffer;
-
-	buffer = V4L2R_BUFFER_GET(drv, buf_id);
-	if (!buffer)
-		return VA_STATUS_ERROR_INVALID_BUFFER;
-
-	return VA_STATUS_SUCCESS;
-}
-
-VAStatus v4l2r_DestroyBuffer(VADriverContextP va_ctx, VABufferID buf_id)
-{
-	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
+	struct v4l2r_surface *begin = NULL;
 	struct v4l2r_buffer *buffer;
 
 	pthread_mutex_lock(&drv->mutex);
@@ -126,6 +109,98 @@ VAStatus v4l2r_DestroyBuffer(VADriverContextP va_ctx, VABufferID buf_id)
 		pthread_mutex_unlock(&drv->mutex);
 		return VA_STATUS_ERROR_INVALID_BUFFER;
 	}
+	if (buffer->derived && buffer->surface) {
+		/* A later map that also writes: its end cleans, the
+		 * first map's begin invalidated already. */
+		if (!buffer->map_count++)
+			begin = buffer->surface;
+		buffer->map_access |= access;
+	}
+	*pbuf = buffer->data;
+	pthread_mutex_unlock(&drv->mutex);
+
+	if (begin)
+		v4l2r_surface_cpu_begin(drv, begin, access);
+
+	return VA_STATUS_SUCCESS;
+}
+
+VAStatus v4l2r_MapBuffer(VADriverContextP va_ctx, VABufferID buf_id, void **pbuf)
+{
+	return buffer_map(v4l2r_driver(va_ctx), buf_id, pbuf, DMA_BUF_SYNC_RW);
+}
+
+#if VA_CHECK_VERSION(1, 21, 0)
+VAStatus v4l2r_MapBuffer2(VADriverContextP va_ctx, VABufferID buf_id,
+			  void **pbuf, uint32_t flags)
+{
+	uint64_t access = 0;
+
+	if (flags & VA_MAPBUFFER_FLAG_READ)
+		access |= DMA_BUF_SYNC_READ;
+	if (flags & VA_MAPBUFFER_FLAG_WRITE)
+		access |= DMA_BUF_SYNC_WRITE;
+
+	/* VA_MAPBUFFER_FLAG_DEFAULT: both */
+	return buffer_map(v4l2r_driver(va_ctx), buf_id, pbuf,
+			  access ? access : DMA_BUF_SYNC_RW);
+}
+#endif
+
+/* The last unmap of a derived image (or its destruction while mapped): the
+ * surface to end the CPU's access to, and how; under the driver mutex. */
+static struct v4l2r_surface *buffer_unmap_locked(struct v4l2r_buffer *buffer,
+						 bool all, uint64_t *access)
+{
+	if (!buffer->derived || !buffer->map_count)
+		return NULL;
+
+	buffer->map_count = all ? 0 : buffer->map_count - 1;
+	if (buffer->map_count)
+		return NULL;
+
+	*access = buffer->map_access;
+	buffer->map_access = 0;
+	return buffer->surface;
+}
+
+VAStatus v4l2r_UnmapBuffer(VADriverContextP va_ctx, VABufferID buf_id)
+{
+	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
+	struct v4l2r_surface *end;
+	struct v4l2r_buffer *buffer;
+	uint64_t access = 0;
+
+	pthread_mutex_lock(&drv->mutex);
+	buffer = V4L2R_BUFFER(drv, buf_id);
+	if (!buffer) {
+		pthread_mutex_unlock(&drv->mutex);
+		return VA_STATUS_ERROR_INVALID_BUFFER;
+	}
+	end = buffer_unmap_locked(buffer, false, &access);
+	pthread_mutex_unlock(&drv->mutex);
+
+	if (end)
+		v4l2r_surface_cpu_end(drv, end, access);
+
+	return VA_STATUS_SUCCESS;
+}
+
+VAStatus v4l2r_DestroyBuffer(VADriverContextP va_ctx, VABufferID buf_id)
+{
+	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
+	struct v4l2r_surface *end;
+	struct v4l2r_buffer *buffer;
+	uint64_t access = 0;
+
+	pthread_mutex_lock(&drv->mutex);
+	buffer = V4L2R_BUFFER(drv, buf_id);
+	if (!buffer) {
+		pthread_mutex_unlock(&drv->mutex);
+		return VA_STATUS_ERROR_INVALID_BUFFER;
+	}
+
+	end = buffer_unmap_locked(buffer, true, &access);
 
 	/* Derived image buffers point into the CAPTURE buffer mapping. */
 	if (!buffer->derived)
@@ -135,6 +210,10 @@ VAStatus v4l2r_DestroyBuffer(VADriverContextP va_ctx, VABufferID buf_id)
 
 	v4l2r_handles_free(&drv->buffers, buf_id);
 	pthread_mutex_unlock(&drv->mutex);
+
+	/* Destroyed while mapped: the access ends here. */
+	if (end)
+		v4l2r_surface_cpu_end(drv, end, access);
 
 	return VA_STATUS_SUCCESS;
 }

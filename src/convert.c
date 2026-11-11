@@ -541,6 +541,7 @@ VAStatus v4l2r_vpp_end_picture(struct v4l2r_context *ctx)
 		goto done;
 	}
 
+	v4l2r_surface_device_wrote(ctx->drv, dst);
 	status = vpp_run(vpp, src, dst);
 
 done:

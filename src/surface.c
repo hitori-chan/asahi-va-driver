@@ -18,6 +18,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <linux/dma-buf.h>
 #include <linux/videodev2.h>
 
 #include <drm_fourcc.h>
@@ -41,6 +42,9 @@ static void surface_unmap(struct v4l2r_surface *surface)
 	}
 
 	surface->nb_planes = 0;
+	surface->cached = false;
+	surface->cpu_lines = false;
+	surface->device_wrote = false;
 	memset(surface->dmabuf_fd, -1,
 	       VIDEO_MAX_PLANES * sizeof(*surface->dmabuf_fd));
 	memset(surface->map, 0,
@@ -179,6 +183,10 @@ VAStatus v4l2r_QuerySurfaceStatus(VADriverContextP va_ctx,
 	    surface->status == VASurfaceRendering)
 		v4l2r_reap_capture(surface->ctx);
 
+	/* Ready: the client may hand it to another device now. */
+	if (surface->status == VASurfaceReady)
+		v4l2r_surface_settle(drv, surface, false);
+
 	*status = surface->status;
 
 	return VA_STATUS_SUCCESS;
@@ -270,6 +278,9 @@ VAStatus v4l2r_surface_ready(struct v4l2r_surface *surface)
 	v4l2r_trace("export sync (surface 0x%08x buf #%d): %.2f ms\n",
 		    surface->id, surface->capture_index,
 		    (v4l2r_now_ns() - t0) / 1e6);
+
+	if (status == VA_STATUS_SUCCESS)
+		v4l2r_surface_settle(surface->ctx->drv, surface, false);
 
 	return status;
 }
@@ -379,9 +390,26 @@ static int surface_alloc(struct v4l2r_decoder *dec,
 		.memory = V4L2_MEMORY_MMAP,
 		.format = cap,
 	};
+#ifdef V4L2_MEMORY_FLAG_NON_COHERENT
+	/*
+	 * Cached memory where the decoder offers it (AVD is not DMA-coherent,
+	 * so its CAPTURE memory is otherwise mapped uncached and every CPU
+	 * read of a picture is a bus read). The kernel keeps the flag only
+	 * when it honours it (vb2_set_flags_and_caps()); a kernel without the
+	 * hints, or with the field reserved, returns it cleared.
+	 */
+	if (v4l2r_cache_mode() != V4L2R_CACHE_COHERENT)
+		buffers.flags = V4L2_MEMORY_FLAG_NON_COHERENT;
+#endif
 
 	if (ioctl(fd, VIDIOC_CREATE_BUFS, &buffers) < 0)
 		goto done;
+
+#ifdef V4L2_MEMORY_FLAG_NON_COHERENT
+	surface->cached = (buffers.capabilities &
+			   V4L2_BUF_CAP_SUPPORTS_MMAP_CACHE_HINTS) &&
+			  (buffers.flags & V4L2_MEMORY_FLAG_NON_COHERENT);
+#endif
 
 	buffer.type = cap.type;
 	buffer.index = buffers.index;
@@ -417,11 +445,12 @@ static int surface_alloc(struct v4l2r_decoder *dec,
 		for (unsigned int i = 0; i < surface->nb_planes; i++)
 			got += surface->plane_size[i];
 
-		v4l2r_trace("allocated SURFACE 0x%x%s %.4s %.4s (%zu bytes, ~%llu MiB)\n",
+		v4l2r_trace("allocated SURFACE 0x%x%s %.4s %.4s (%zu bytes, ~%llu MiB, %s)\n",
 			    surface->id, ctx_cap ? "" : " (no ctx)",
 			    (const char *)&(uint32_t){pixfmt},
 			    (const char *)&(uint32_t){out.fmt.pix_mp.pixelformat},
-			    got, (unsigned long long)((uint64_t)got >> 20));
+			    got, (unsigned long long)((uint64_t)got >> 20),
+			    surface->cached ? "cached" : "uncached");
 	}
 
 done:
@@ -494,6 +523,119 @@ VAStatus v4l2r_surface_prepare(struct v4l2r_driver *drv,
 	}
 
 	return VA_STATUS_SUCCESS;
+}
+
+/*
+ * The backing's CPU caching. A backing the kernel made cached is kept
+ * coherent with the decoder, which is not, through its dma-buf: invalidated
+ * before the CPU's access, cleaned after a write (DMA_BUF_IOCTL_SYNC, the
+ * exporter's begin/end_cpu_access). The decoder's own queue imports the
+ * dma-buf and syncs nothing, so these are the only points. One more: a
+ * decode overwrites lines the CPU may still hold from a read of the previous
+ * contents, which a coherent reader (the GPU) could be served; those are
+ * dropped before the picture goes to another device (v4l2r_surface_settle()).
+ * An uncached backing needs none of it.
+ */
+static void surface_dmabuf_sync(const struct v4l2r_surface *surface,
+				uint64_t flags)
+{
+	for (unsigned int i = 0; i < surface->nb_planes; i++) {
+		struct dma_buf_sync sync = { .flags = flags };
+
+		if (surface->dmabuf_fd[i] < 0)
+			continue;
+		while (ioctl(surface->dmabuf_fd[i], DMA_BUF_IOCTL_SYNC, &sync) < 0 &&
+		       (errno == EINTR || errno == EAGAIN))
+			continue;
+	}
+}
+
+static const char *access_name(uint64_t access)
+{
+	switch (access & DMA_BUF_SYNC_RW) {
+	case DMA_BUF_SYNC_READ:
+		return "read";
+	case DMA_BUF_SYNC_WRITE:
+		return "write";
+	default:
+		return "rw";
+	}
+}
+
+void v4l2r_surface_cpu_begin(struct v4l2r_driver *drv,
+			     struct v4l2r_surface *surface, uint64_t access)
+{
+	bool cached;
+	uint64_t t0;
+
+	pthread_mutex_lock(&drv->mutex);
+	cached = surface->cached;
+	if (cached) {
+		surface->cpu_lines = true;
+		surface->device_wrote = false;
+	}
+	pthread_mutex_unlock(&drv->mutex);
+
+	if (!cached)
+		return;
+
+	t0 = v4l2r_now_ns();
+	surface_dmabuf_sync(surface, DMA_BUF_SYNC_START | (access & DMA_BUF_SYNC_RW));
+	v4l2r_trace("cpu begin (surface 0x%08x, %s): %.3f ms\n", surface->id,
+		    access_name(access), (v4l2r_now_ns() - t0) / 1e6);
+}
+
+void v4l2r_surface_cpu_end(struct v4l2r_driver *drv,
+			   struct v4l2r_surface *surface, uint64_t access)
+{
+	bool cached;
+	uint64_t t0;
+
+	pthread_mutex_lock(&drv->mutex);
+	cached = surface->cached;
+	pthread_mutex_unlock(&drv->mutex);
+
+	if (!cached)
+		return;
+
+	t0 = v4l2r_now_ns();
+	surface_dmabuf_sync(surface, DMA_BUF_SYNC_END | (access & DMA_BUF_SYNC_RW));
+	v4l2r_trace("cpu end (surface 0x%08x, %s): %.3f ms\n", surface->id,
+		    access_name(access), (v4l2r_now_ns() - t0) / 1e6);
+}
+
+void v4l2r_surface_device_wrote(struct v4l2r_driver *drv,
+				struct v4l2r_surface *surface)
+{
+	pthread_mutex_lock(&drv->mutex);
+	surface->device_wrote = true;
+	pthread_mutex_unlock(&drv->mutex);
+}
+
+void v4l2r_surface_settle(struct v4l2r_driver *drv,
+			  struct v4l2r_surface *surface, bool exporting)
+{
+	bool stale;
+	uint64_t t0;
+
+	pthread_mutex_lock(&drv->mutex);
+	stale = surface->cached && surface->cpu_lines && surface->device_wrote &&
+		(exporting || surface->exported) &&
+		v4l2r_cache_mode() != V4L2R_CACHE_NOSETTLE;
+	if (stale) {
+		surface->cpu_lines = false;
+		surface->device_wrote = false;
+	}
+	pthread_mutex_unlock(&drv->mutex);
+
+	if (!stale)
+		return;
+
+	t0 = v4l2r_now_ns();
+	surface_dmabuf_sync(surface, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
+	surface_dmabuf_sync(surface, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+	v4l2r_trace("settle (surface 0x%08x): %.3f ms\n", surface->id,
+		    (v4l2r_now_ns() - t0) / 1e6);
 }
 
 /*
@@ -675,6 +817,8 @@ VAStatus v4l2r_ExportSurfaceHandle(VADriverContextP va_ctx, VASurfaceID surface_
 	status = v4l2r_surface_prepare(drv, surface, false);
 	if (status != VA_STATUS_SUCCESS)
 		return status;
+
+	v4l2r_surface_settle(drv, surface, true);
 
 	status = fill_prime_descriptor(surface, flags, descriptor);
 	if (status == VA_STATUS_SUCCESS) {

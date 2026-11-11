@@ -71,6 +71,30 @@ void v4l2r_trace(const char *fmt, ...)
 	fputs(buf, stderr);
 }
 
+/*
+ * LIBVA_V4L2_CACHE, for A/B runs on one kernel: "coherent" never asks for
+ * cached CAPTURE memory (the driver as before the cache hints), "nosettle"
+ * keeps it cached without v4l2r_surface_settle(). Unset or anything else:
+ * cached wherever the kernel offers it.
+ */
+enum v4l2r_cache_mode v4l2r_cache_mode(void)
+{
+	static int mode = -1;
+
+	if (mode < 0) {
+		const char *env = getenv("LIBVA_V4L2_CACHE");
+
+		if (env && !strcmp(env, "coherent"))
+			mode = V4L2R_CACHE_COHERENT;
+		else if (env && !strcmp(env, "nosettle"))
+			mode = V4L2R_CACHE_NOSETTLE;
+		else
+			mode = V4L2R_CACHE_DEFAULT;
+	}
+
+	return mode;
+}
+
 /* --- codec and format tables --- */
 
 static const struct v4l2r_codec *const codecs[] = {
@@ -908,6 +932,9 @@ VAStatus V4L2R_DRIVER_INIT(VADriverContextP va_ctx)
 	vtable->vaCreateBuffer = v4l2r_CreateBuffer;
 	vtable->vaBufferSetNumElements = v4l2r_BufferSetNumElements;
 	vtable->vaMapBuffer = v4l2r_MapBuffer;
+#if VA_CHECK_VERSION(1, 21, 0)
+	vtable->vaMapBuffer2 = v4l2r_MapBuffer2;
+#endif
 	vtable->vaUnmapBuffer = v4l2r_UnmapBuffer;
 	vtable->vaDestroyBuffer = v4l2r_DestroyBuffer;
 	vtable->vaBufferInfo = v4l2r_BufferInfo;

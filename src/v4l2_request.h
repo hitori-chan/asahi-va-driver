@@ -175,6 +175,14 @@ struct v4l2r_surface {
 	bool exported;
 	unsigned int derived;
 
+	/* The backing's CPU caching (surface.c, driver mutex): cached when the
+	 * kernel honoured V4L2_MEMORY_FLAG_NON_COHERENT; then whether the CPU
+	 * may hold lines of it, and whether a device (the decoder) wrote it
+	 * since the CPU last dropped them. */
+	bool cached;
+	bool cpu_lines;
+	bool device_wrote;
+
 	/* Codec scratch, e.g. the AV1 order hint of the decoded frame. */
 	uint32_t codec_tag;
 };
@@ -185,6 +193,31 @@ VAStatus v4l2r_surface_prepare(struct v4l2r_driver *drv,
  * next prepare allocates one that can; -1 when the client holds it. */
 int v4l2r_surface_fit(struct v4l2r_driver *drv, struct v4l2r_surface *surface,
 		      const struct v4l2_format *format);
+
+/*
+ * The CPU's access to a mapped backing, access DMA_BUF_SYNC_READ, _WRITE or
+ * _RW: a cached backing's caches kept around it (DMA_BUF_IOCTL_SYNC). No-ops
+ * on an uncached one.
+ */
+void v4l2r_surface_cpu_begin(struct v4l2r_driver *drv,
+			     struct v4l2r_surface *surface, uint64_t access);
+void v4l2r_surface_cpu_end(struct v4l2r_driver *drv,
+			   struct v4l2r_surface *surface, uint64_t access);
+/* A device wrote the backing (the decoder, a converter). */
+void v4l2r_surface_device_wrote(struct v4l2r_driver *drv,
+				struct v4l2r_surface *surface);
+/* Before another device reads a backing the client was given (exporting:
+ * being given now): drop the CPU's lines a device wrote over. */
+void v4l2r_surface_settle(struct v4l2r_driver *drv,
+			  struct v4l2r_surface *surface, bool exporting);
+
+/* LIBVA_V4L2_CACHE (driver.c), for A/B runs. */
+enum v4l2r_cache_mode {
+	V4L2R_CACHE_DEFAULT,	/* cached where the kernel offers it */
+	V4L2R_CACHE_COHERENT,	/* "coherent": never ask for cached memory */
+	V4L2R_CACHE_NOSETTLE,	/* "nosettle": cached, v4l2r_surface_settle() off */
+};
+enum v4l2r_cache_mode v4l2r_cache_mode(void);
 
 /* Per CAPTURE buffer state, lives in the context that allocated it. The
  * buffer holds the current decoded content of ->surface, or is free when
@@ -227,6 +260,10 @@ struct v4l2r_buffer {
 	bool derived;
 	/* The surface a derived image maps, NULL once that is destroyed. */
 	struct v4l2r_surface *surface;
+	/* A derived image's maps open, and the DMA_BUF_SYNC_* access they
+	 * asked for (driver mutex). */
+	unsigned int map_count;
+	uint64_t map_access;
 };
 
 struct v4l2r_image {
@@ -586,6 +623,10 @@ VAStatus v4l2r_BufferSetNumElements(VADriverContextP va_ctx, VABufferID buf_id,
 				    unsigned int num_elements);
 VAStatus v4l2r_MapBuffer(VADriverContextP va_ctx, VABufferID buf_id,
 			 void **pbuf);
+#if VA_CHECK_VERSION(1, 21, 0)
+VAStatus v4l2r_MapBuffer2(VADriverContextP va_ctx, VABufferID buf_id,
+			  void **pbuf, uint32_t flags);
+#endif
 VAStatus v4l2r_UnmapBuffer(VADriverContextP va_ctx, VABufferID buf_id);
 VAStatus v4l2r_DestroyBuffer(VADriverContextP va_ctx, VABufferID buf_id);
 VAStatus v4l2r_BufferInfo(VADriverContextP va_ctx, VABufferID buf_id,
