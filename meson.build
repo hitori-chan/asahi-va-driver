@@ -64,6 +64,7 @@ sources = [
   'src/codec/vp8.c',
   'src/codec/vp9.c',
   'src/codec/av1.c',
+  'src/codec/av1_grain.c',
 ]
 
 shared_module('asahi_drv_video',

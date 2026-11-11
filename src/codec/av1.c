@@ -13,10 +13,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <linux/dma-buf.h>
 #include <linux/videodev2.h>
 #include <linux/v4l2-controls.h>
 
 #include "codec.h"
+#include "av1_grain.h"
 
 #if HAVE_V4L2_CTRL_AV1
 
@@ -25,9 +27,40 @@
 #define AV1_KEY_FRAME		0
 #define AV1_INTRA_ONLY_FRAME	2
 #define AV1_SUPERRES_NUM	8
+#define AV1_MC_IDENTITY		0
+
+/*
+ * Film grain, applied by the driver: AVD has no grain synthesis (AppleAVD
+ * hands the parameters up to VideoToolbox), so the decoder writes the
+ * reference without grain into current_frame and the driver writes it with
+ * grain into current_display_picture, once the decode is done.
+ */
+struct av1_grain_job {
+	struct v4l2r_surface *src;	/* current_frame, the decoded picture */
+	struct v4l2r_surface *dst;	/* current_display_picture */
+	struct av1_grain_params params;
+	unsigned int width;		/* UpscaledWidth */
+	unsigned int height;		/* FrameHeight */
+};
 
 struct av1_context {
 	bool has_film_grain;
+
+	/* The frame being assembled: its display picture to write. */
+	bool cur_grain;
+	struct av1_grain_job cur_job;
+	/* The held frame's. */
+	bool pend_grain;
+	struct av1_grain_job pend_job;
+	/*
+	 * Submitted frames whose display picture is still to be written: each
+	 * is written when it is read, when its source is about to be read or
+	 * overwritten, or when the context goes.
+	 */
+	struct av1_grain_job *jobs;
+	unsigned int nb_jobs;
+	unsigned int alloc_jobs;
+	struct av1_grain_state *grain;
 
 	VADecPictureParameterBufferAV1 va_pic;
 	bool have_pic;
@@ -537,14 +570,13 @@ static void av1_fill_film_grain(struct av1_context *codec)
 		.cr_offset = fg->cr_offset,
 	};
 
-	if (fg->film_grain_info_fields.bits.apply_grain) {
-		ctrl->flags |= V4L2_AV1_FILM_GRAIN_FLAG_APPLY_GRAIN;
-		/* VA-API delivers fully resolved grain parameters (there is no
-		 * update_grain / params_ref_idx in the interface). Mark them as
-		 * an update so the decoder uses the values here instead of
-		 * loading stale grain state from a reference slot. */
-		ctrl->flags |= V4L2_AV1_FILM_GRAIN_FLAG_UPDATE_GRAIN;
-	}
+	/*
+	 * The CAPTURE buffer is current_frame, the reference, which VA-API
+	 * keeps without grain: the decoder is never asked to apply it. The
+	 * driver adds it to current_display_picture (av1_grain_run()). The
+	 * parameters stay for the record, VA-API's fully resolved ones (it has
+	 * no update_grain or film_grain_params_ref_idx).
+	 */
 	if (fg->film_grain_info_fields.bits.chroma_scaling_from_luma)
 		ctrl->flags |= V4L2_AV1_FILM_GRAIN_FLAG_CHROMA_SCALING_FROM_LUMA;
 	if (fg->film_grain_info_fields.bits.overlap_flag)
@@ -576,6 +608,356 @@ static void av1_fill_film_grain(struct av1_context *codec)
 	}
 }
 
+/* --- film grain --- */
+
+/* The frame's grain parameters and display picture (VA-API's
+ * current_display_picture), when the client asks for the grain. */
+static void av1_grain_prepare(struct v4l2r_context *ctx)
+{
+	struct av1_context *codec = ctx->codec_priv;
+	const VADecPictureParameterBufferAV1 *pic = &codec->va_pic;
+	const VAFilmGrainStructAV1 *fg = &pic->film_grain_info;
+	struct av1_grain_job *job = &codec->cur_job;
+	struct av1_grain_params *p = &job->params;
+	static const uint8_t bit_depths[3] = { 8, 10, 12 };
+	static bool warned;
+
+	codec->cur_grain = false;
+
+	if (!pic->seq_info_fields.fields.film_grain_params_present ||
+	    !fg->film_grain_info_fields.bits.apply_grain)
+		return;
+
+	/* The grain goes into a picture of its own; current_frame stays the
+	 * reference without it. */
+	job->dst = pic->current_display_picture != pic->current_frame ?
+		   V4L2R_SURFACE_GET(ctx->drv, pic->current_display_picture) :
+		   NULL;
+	if (!job->dst || job->dst == ctx->pic.target) {
+		if (!warned)
+			v4l2r_log("av1: film grain without a display picture "
+				  "of its own (0x%x): shown without grain\n",
+				  pic->current_display_picture);
+		warned = true;
+		return;
+	}
+	job->src = NULL;	/* the render target, at EndPicture */
+	job->width = pic->frame_width_minus1 + 1;
+	job->height = pic->frame_height_minus1 + 1;
+
+	*p = (struct av1_grain_params) {
+		.grain_seed = fg->grain_seed,
+		.num_y_points = fg->num_y_points,
+		.num_cb_points = fg->num_cb_points,
+		.num_cr_points = fg->num_cr_points,
+		.chroma_scaling_from_luma =
+			fg->film_grain_info_fields.bits.chroma_scaling_from_luma,
+		.grain_scaling_minus_8 =
+			fg->film_grain_info_fields.bits.grain_scaling_minus_8,
+		.ar_coeff_lag = fg->film_grain_info_fields.bits.ar_coeff_lag,
+		.ar_coeff_shift_minus_6 =
+			fg->film_grain_info_fields.bits.ar_coeff_shift_minus_6,
+		.grain_scale_shift =
+			fg->film_grain_info_fields.bits.grain_scale_shift,
+		.cb_mult = fg->cb_mult,
+		.cb_luma_mult = fg->cb_luma_mult,
+		.cb_offset = fg->cb_offset,
+		.cr_mult = fg->cr_mult,
+		.cr_luma_mult = fg->cr_luma_mult,
+		.cr_offset = fg->cr_offset,
+		.overlap_flag = fg->film_grain_info_fields.bits.overlap_flag,
+		.clip_to_restricted_range =
+			fg->film_grain_info_fields.bits.clip_to_restricted_range,
+		.bit_depth = bit_depths[pic->bit_depth_idx < 3 ?
+					pic->bit_depth_idx : 0],
+		.subsampling_x = pic->seq_info_fields.fields.subsampling_x,
+		.subsampling_y = pic->seq_info_fields.fields.subsampling_y,
+		.mono_chrome = pic->seq_info_fields.fields.mono_chrome,
+		.mc_identity = pic->matrix_coefficients == AV1_MC_IDENTITY,
+	};
+	/* The counts are checked against the arrays before use
+	 * (av1_grain_supported()). */
+	memcpy(p->point_y_value, fg->point_y_value, sizeof(p->point_y_value));
+	memcpy(p->point_y_scaling, fg->point_y_scaling, sizeof(p->point_y_scaling));
+	memcpy(p->point_cb_value, fg->point_cb_value, sizeof(p->point_cb_value));
+	memcpy(p->point_cb_scaling, fg->point_cb_scaling, sizeof(p->point_cb_scaling));
+	memcpy(p->point_cr_value, fg->point_cr_value, sizeof(p->point_cr_value));
+	memcpy(p->point_cr_scaling, fg->point_cr_scaling, sizeof(p->point_cr_scaling));
+	memcpy(p->ar_coeffs_y, fg->ar_coeffs_y, sizeof(p->ar_coeffs_y));
+	memcpy(p->ar_coeffs_cb, fg->ar_coeffs_cb, sizeof(p->ar_coeffs_cb));
+	memcpy(p->ar_coeffs_cr, fg->ar_coeffs_cr, sizeof(p->ar_coeffs_cr));
+
+	codec->cur_grain = true;
+}
+
+/*
+ * Luma and chroma of an NV12 or P010 surface, as image.c lays them out, and
+ * the bytes of its chroma plane: the rows of the surface's height, within
+ * the memory (an AV1 CAPTURE buffer goes on past the picture with the
+ * frame's CDFs and motion vectors).
+ */
+static void av1_grain_image(const struct v4l2r_surface *surface,
+			    struct av1_grain_image *image, size_t *chroma_size)
+{
+	size_t rows = (size_t)surface->pitch * ((surface->height + 1) / 2);
+	size_t room;
+
+	image->luma = surface->map[0];
+	image->luma_pitch = surface->pitch;
+	image->chroma_pitch = surface->pitch;
+	if (surface->nb_planes > 1) {
+		image->chroma = surface->map[1];
+		room = surface->plane_size[1];
+	} else {
+		size_t luma_size = (size_t)surface->pitch * surface->height;
+
+		image->chroma = image->luma + luma_size;
+		room = surface->plane_size[0] > luma_size ?
+		       surface->plane_size[0] - luma_size : 0;
+	}
+	*chroma_size = rows < room ? rows : room;
+}
+
+/*
+ * Whether the picture fits both surfaces, so that the synthesis or the copy
+ * stays inside them: the rows of w samples (and of w + 1 for the chroma of
+ * an odd width) within the pitch, the h rows and their chroma within the
+ * planes.
+ */
+static bool av1_grain_fits(const struct v4l2r_surface *surface,
+			   const struct av1_grain_image *image,
+			   size_t chroma_size, unsigned int w, unsigned int h,
+			   unsigned int sample)
+{
+	size_t chroma_rows = (h + 1) / 2;
+
+	return w <= surface->width && h <= surface->height &&
+	       (size_t)(w + 1) / 2 * 2 * sample <= image->chroma_pitch &&
+	       (size_t)w * sample <= image->luma_pitch &&
+	       (size_t)image->luma_pitch * h <=
+			(surface->nb_planes > 1 ? surface->plane_size[0] :
+			 (size_t)surface->pitch * surface->height) &&
+	       chroma_rows * image->chroma_pitch <= chroma_size;
+}
+
+static void av1_grain_take(struct av1_context *codec, unsigned int i,
+			   struct av1_grain_job *job)
+{
+	*job = codec->jobs[i];
+	memmove(&codec->jobs[i], &codec->jobs[i + 1],
+		(codec->nb_jobs - i - 1) * sizeof(*job));
+	codec->nb_jobs--;
+}
+
+static void av1_grain_run(struct v4l2r_context *ctx,
+			  struct av1_grain_job *job);
+
+/* Write every display picture still to be read from surface, before its
+ * contents go. */
+static void av1_grain_release(struct v4l2r_context *ctx,
+			      struct v4l2r_surface *surface)
+{
+	struct av1_context *codec = ctx->codec_priv;
+	unsigned int i = 0;
+
+	while (i < codec->nb_jobs) {
+		struct av1_grain_job job;
+
+		if (codec->jobs[i].src != surface) {
+			i++;
+			continue;
+		}
+
+		av1_grain_take(codec, i, &job);
+		av1_grain_run(ctx, &job);
+		i = 0;	/* the run may have taken others */
+	}
+}
+
+/* Forget the display pictures still to be written into surface: what is
+ * about to be written there replaces them. */
+static void av1_grain_drop(struct av1_context *codec,
+			   struct v4l2r_surface *surface)
+{
+	unsigned int i = 0;
+
+	while (i < codec->nb_jobs) {
+		struct av1_grain_job job;
+
+		if (codec->jobs[i].dst == surface)
+			av1_grain_take(codec, i, &job);
+		else
+			i++;
+	}
+}
+
+/*
+ * Write a display picture: the source's decode done, the grain added as
+ * section 7.18.3 of the AV1 specification gives it. When the synthesis
+ * cannot take the picture, the display picture gets it without grain, never
+ * stale contents.
+ */
+static void av1_grain_run(struct v4l2r_context *ctx,
+			  struct av1_grain_job *job)
+{
+	struct av1_context *codec = ctx->codec_priv;
+	struct v4l2r_surface *src = job->src, *dst = job->dst;
+	struct av1_grain_image in, out;
+	size_t in_chroma, out_chroma;
+	unsigned int w = job->width, h = job->height, sample;
+	uint64_t t0 = v4l2r_now_ns(), t[7];
+	const char *how = "grain";
+	static bool warned;
+	bool cached;
+
+	/* What dst holds now is replaced: write first what is read from it. */
+	av1_grain_release(ctx, dst);
+	t[0] = v4l2r_now_ns();
+
+	if (!src || src->ctx != ctx || src->capture_index < 0 ||
+	    !ctx->streaming) {
+		v4l2r_log("av1: display picture 0x%x: its frame was never "
+			  "decoded\n", dst->id);
+		dst->status = VASurfaceReady;
+		return;
+	}
+
+	v4l2r_sync_capture(ctx, src->capture_index);
+	t[1] = v4l2r_now_ns();
+
+	/* The display picture gets a CAPTURE buffer of this context, like a
+	 * decode target: the same layout as the source, and the wait for
+	 * the frames and readers still on its previous contents. */
+	if (v4l2r_context_bind_surface(ctx, dst) != VA_STATUS_SUCCESS ||
+	    v4l2r_surface_prepare(ctx->drv, src, true) != VA_STATUS_SUCCESS ||
+	    v4l2r_surface_prepare(ctx->drv, dst, true) != VA_STATUS_SUCCESS) {
+		v4l2r_log("av1: display picture 0x%x: no memory to write it\n",
+			  dst->id);
+		dst->status = VASurfaceReady;
+		return;
+	}
+
+	t[2] = v4l2r_now_ns();
+	v4l2r_surface_cpu_begin(ctx->drv, src, DMA_BUF_SYNC_READ);
+	v4l2r_surface_cpu_begin(ctx->drv, dst, DMA_BUF_SYNC_WRITE);
+	t[3] = v4l2r_now_ns();
+
+	pthread_mutex_lock(&ctx->drv->mutex);
+	cached = src->cached || dst->cached;
+	pthread_mutex_unlock(&ctx->drv->mutex);
+
+	sample = src->info && src->info->va_fourcc == VA_FOURCC_P010 ? 2 : 1;
+	av1_grain_image(src, &in, &in_chroma);
+	av1_grain_image(dst, &out, &out_chroma);
+
+	if (!codec->grain)
+		codec->grain = av1_grain_state_new();
+
+	if (src->info && dst->info == src->info && src->info->linear &&
+	    src->pitch == dst->pitch && src->height == dst->height &&
+	    src->nb_planes == dst->nb_planes &&
+	    (src->info->va_fourcc == VA_FOURCC_NV12 ||
+	     src->info->va_fourcc == VA_FOURCC_P010) &&
+	    job->params.bit_depth == (sample == 2 ? 10u : 8u) &&
+	    av1_grain_fits(src, &in, in_chroma, w, h, sample) &&
+	    av1_grain_fits(dst, &out, out_chroma, w, h, sample) &&
+	    codec->grain &&
+	    av1_grain_apply(codec->grain, &job->params, &in, &out, w, h) == 0) {
+		size_t chroma_rows = (in_chroma < out_chroma ? in_chroma : out_chroma) /
+				     in.chroma_pitch;
+
+		t[4] = v4l2r_now_ns();
+		/* Past the picture (the alignment of the CAPTURE format) dst
+		 * gets what the decoder wrote, as without grain: the
+		 * synthesis wrote the picture's rows whole, the rows below
+		 * it follow. */
+		memcpy(out.luma + (size_t)h * in.luma_pitch,
+		       in.luma + (size_t)h * in.luma_pitch,
+		       (size_t)(src->height - h) * in.luma_pitch);
+		if (chroma_rows > (h + 1) / 2)
+			memcpy(out.chroma + (size_t)(h + 1) / 2 * in.chroma_pitch,
+			       in.chroma + (size_t)(h + 1) / 2 * in.chroma_pitch,
+			       (chroma_rows - (h + 1) / 2) * in.chroma_pitch);
+	} else {
+		/* The picture without grain. */
+		how = "copy";
+		if (!warned)
+			v4l2r_log("av1: film grain not supported here (%u-bit, "
+				  "%ux%u, %.4s): shown without grain\n",
+				  job->params.bit_depth, w, h,
+				  src->info ? (const char *)&src->info->pixelformat : "?");
+		warned = true;
+		for (unsigned int i = 0; i < src->nb_planes && i < dst->nb_planes; i++)
+			memcpy(dst->map[i], src->map[i],
+			       src->plane_size[i] < dst->plane_size[i] ?
+			       src->plane_size[i] : dst->plane_size[i]);
+		t[4] = v4l2r_now_ns();
+	}
+
+	t[5] = v4l2r_now_ns();
+	v4l2r_surface_cpu_end(ctx->drv, dst, DMA_BUF_SYNC_WRITE);
+	v4l2r_surface_cpu_end(ctx->drv, src, DMA_BUF_SYNC_READ);
+	t[6] = v4l2r_now_ns();
+
+	dst->status = VASurfaceReady;
+
+	/* Where the time goes: the runs this one did first (others), the wait
+	 * for the source's decode, the display picture's binding (its waits
+	 * included), the cache syncs before and after, the synthesis (or the
+	 * copy) and the rows past the picture. */
+	v4l2r_trace("av1 grain parts (surface 0x%08x -> 0x%08x, %s): others %.3f, "
+		    "wait %.3f, bind %.3f, sync %.3f, %s %.3f, margins %.3f, "
+		    "end %.3f ms\n", src->id, dst->id,
+		    cached ? "cached" : "uncached",
+		    (t[0] - t0) / 1e6, (t[1] - t[0]) / 1e6, (t[2] - t[1]) / 1e6,
+		    (t[3] - t[2]) / 1e6, how, (t[4] - t[3]) / 1e6,
+		    (t[5] - t[4]) / 1e6, (t[6] - t[5]) / 1e6);
+	v4l2r_trace("av1 grain (surface 0x%08x -> 0x%08x, %ux%u): %s %.2f ms\n",
+		    src->id, dst->id, w, h, how, (v4l2r_now_ns() - t0) / 1e6);
+}
+
+/* A submitted frame's display picture, to write. */
+static void av1_grain_add(struct v4l2r_context *ctx,
+			  const struct av1_grain_job *job)
+{
+	struct av1_context *codec = ctx->codec_priv;
+
+	/* An earlier frame's display picture in the same surface was let go. */
+	av1_grain_drop(codec, job->dst);
+
+	if (v4l2r_array_reserve((void **)&codec->jobs, &codec->alloc_jobs,
+				codec->nb_jobs + 1, sizeof(*codec->jobs)) < 0) {
+		struct av1_grain_job now = *job;
+
+		av1_grain_run(ctx, &now);
+		return;
+	}
+
+	codec->jobs[codec->nb_jobs++] = *job;
+}
+
+/* Write the display pictures read from or into target, or all of them. */
+static void av1_grain_flush(struct v4l2r_context *ctx,
+			    struct v4l2r_surface *target)
+{
+	struct av1_context *codec = ctx->codec_priv;
+	unsigned int i = 0;
+
+	while (i < codec->nb_jobs) {
+		struct av1_grain_job job;
+
+		if (target && codec->jobs[i].dst != target &&
+		    codec->jobs[i].src != target) {
+			i++;
+			continue;
+		}
+
+		av1_grain_take(codec, i, &job);
+		av1_grain_run(ctx, &job);
+		i = 0;
+	}
+}
+
 /* --- codec ops --- */
 
 static VAStatus av1_init(struct v4l2r_context *ctx)
@@ -599,13 +981,20 @@ static void av1_uninit(struct v4l2r_context *ctx)
 	free(codec->tiles);
 	free(codec->va_slices);
 	free(codec->pend_tiles);
+	free(codec->jobs);
+	av1_grain_state_free(codec->grain);
 	codec->tiles = NULL;
 	codec->va_slices = NULL;
 	codec->pend_tiles = NULL;
+	codec->jobs = NULL;
+	codec->grain = NULL;
 	codec->alloc_tiles = 0;
 	codec->alloc_va_slices = 0;
 	codec->pend_alloc_tiles = 0;
+	codec->alloc_jobs = 0;
+	codec->nb_jobs = 0;
 	codec->pend_valid = false;
+	codec->pend_grain = false;
 }
 
 static VAStatus av1_begin_picture(struct v4l2r_context *ctx)
@@ -613,6 +1002,7 @@ static VAStatus av1_begin_picture(struct v4l2r_context *ctx)
 	struct av1_context *codec = ctx->codec_priv;
 
 	codec->have_pic = false;
+	codec->cur_grain = false;
 	codec->num_tiles = 0;
 	codec->nb_va_slices = 0;
 	codec->slices_consumed = 0;
@@ -759,10 +1149,23 @@ static VAStatus av1_submit_pending(struct v4l2r_context *ctx, uint8_t refresh)
 	}
 
 	codec->pend_valid = false;
+
+	/* The decode overwrites its target: write first the display pictures
+	 * read from it, and forget those still to be written into it. */
+	if (codec->pend_pic.target) {
+		av1_grain_release(ctx, codec->pend_pic.target);
+		av1_grain_drop(codec, codec->pend_pic.target);
+	}
+
 	saved = ctx->pic;
 	ctx->pic = codec->pend_pic;
 	status = v4l2r_decode(ctx, controls, count, true, true);
 	ctx->pic = saved;
+
+	if (codec->pend_grain) {
+		codec->pend_grain = false;
+		av1_grain_add(ctx, &codec->pend_job);
+	}
 
 	return status;
 }
@@ -771,13 +1174,17 @@ static VAStatus av1_flush(struct v4l2r_context *ctx,
 			  struct v4l2r_surface *target)
 {
 	struct av1_context *codec = ctx->codec_priv;
+	VAStatus status = VA_STATUS_SUCCESS;
 
-	if (!codec->pend_valid)
-		return VA_STATUS_SUCCESS;
-	if (target && codec->pend_pic.target != target)
-		return VA_STATUS_SUCCESS;
+	/* A read of the held frame's target or display picture submits it. */
+	if (codec->pend_valid &&
+	    (!target || codec->pend_pic.target == target ||
+	     (codec->pend_grain && codec->pend_job.dst == target)))
+		status = av1_submit_pending(ctx, codec->pend_fallback);
 
-	return av1_submit_pending(ctx, codec->pend_fallback);
+	av1_grain_flush(ctx, target);
+
+	return status;
 }
 
 static VAStatus av1_render_buffer(struct v4l2r_context *ctx,
@@ -803,6 +1210,7 @@ static VAStatus av1_render_buffer(struct v4l2r_context *ctx,
 		av1_fill_frame(ctx);
 		if (codec->has_film_grain)
 			av1_fill_film_grain(codec);
+		av1_grain_prepare(ctx);
 		return VA_STATUS_SUCCESS;
 	case VASliceParameterBufferType:
 		return av1_store_slice_params(codec, buf);
@@ -850,6 +1258,24 @@ static VAStatus av1_end_picture(struct v4l2r_context *ctx)
 	codec->pend_current = codec->va_pic.current_frame;
 	codec->pend_fallback = av1_fallback_refresh(codec);
 	codec->pend_valid = true;
+
+	/* The display picture is written once the frame is decoded; until
+	 * then it reads as rendering, and a read of it flushes this context. */
+	codec->pend_grain = false;
+	if (codec->cur_grain && ctx->pic.target) {
+		struct v4l2r_surface *dst = codec->cur_job.dst;
+
+		if (dst->ctx && dst->ctx != ctx) {
+			v4l2r_log("av1: display picture 0x%x belongs to another "
+				  "context\n", dst->id);
+		} else {
+			codec->pend_job = codec->cur_job;
+			codec->pend_job.src = ctx->pic.target;
+			codec->pend_grain = true;
+			dst->ctx = ctx;
+			dst->status = VASurfaceRendering;
+		}
+	}
 
 	/* Record the order hint now (later frames reference it while this one
 	 * is still held), and mark the surface as decoding with its owning
