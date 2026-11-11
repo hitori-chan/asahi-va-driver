@@ -14,6 +14,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <linux/dma-buf.h>
 #include <linux/videodev2.h>
 
 #include "v4l2_request.h"
@@ -327,6 +328,9 @@ VAStatus v4l2r_GetImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 
 	image_row_sizes(surface, image, width, &luma_row, &chroma_row);
 
+	uint64_t t0 = v4l2r_now_ns();
+	v4l2r_surface_cpu_begin(drv, surface, DMA_BUF_SYNC_READ);
+
 	/* Full rows with matching pitches: copy each plane in one go. */
 	if (luma_row == surface->pitch && image->pitches[0] == surface->pitch &&
 	    image->pitches[1] == surface->pitch) {
@@ -334,16 +338,21 @@ VAStatus v4l2r_GetImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 		       (size_t)surface->pitch * height);
 		memcpy(dst + image->offsets[1], src_chroma,
 		       (size_t)surface->pitch * ((height + 1) / 2));
-		return VA_STATUS_SUCCESS;
+	} else {
+		for (unsigned int i = 0; i < height; i++)
+			memcpy(dst + image->offsets[0] + i * image->pitches[0],
+			       src_luma + i * surface->pitch, luma_row);
+
+		for (unsigned int i = 0; i < (height + 1) / 2; i++)
+			memcpy(dst + image->offsets[1] + i * image->pitches[1],
+			       src_chroma + i * surface->pitch, chroma_row);
 	}
 
-	for (unsigned int i = 0; i < height; i++)
-		memcpy(dst + image->offsets[0] + i * image->pitches[0],
-		       src_luma + i * surface->pitch, luma_row);
-
-	for (unsigned int i = 0; i < (height + 1) / 2; i++)
-		memcpy(dst + image->offsets[1] + i * image->pitches[1],
-		       src_chroma + i * surface->pitch, chroma_row);
+	v4l2r_surface_cpu_end(drv, surface, DMA_BUF_SYNC_READ);
+	v4l2r_trace("get image (surface 0x%08x, %ux%u, %s): %.3f ms\n",
+		    surface->id, width, height,
+		    surface->cached ? "cached" : "uncached",
+		    (v4l2r_now_ns() - t0) / 1e6);
 
 	return VA_STATUS_SUCCESS;
 }
@@ -416,6 +425,8 @@ VAStatus v4l2r_PutImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 
 	image_row_sizes(surface, image, width, &luma_row, &chroma_row);
 
+	v4l2r_surface_cpu_begin(drv, surface, DMA_BUF_SYNC_WRITE);
+
 	/* Full rows with matching pitches: copy each plane in one go. */
 	if (luma_row == surface->pitch && image->pitches[0] == surface->pitch &&
 	    image->pitches[1] == surface->pitch) {
@@ -423,18 +434,19 @@ VAStatus v4l2r_PutImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 		       (size_t)surface->pitch * height);
 		memcpy(dst_chroma, src + image->offsets[1],
 		       (size_t)surface->pitch * ((height + 1) / 2));
-		return VA_STATUS_SUCCESS;
+	} else {
+		for (unsigned int i = 0; i < height; i++)
+			memcpy(dst_luma + i * surface->pitch,
+			       src + image->offsets[0] + i * image->pitches[0],
+			       luma_row);
+
+		for (unsigned int i = 0; i < (height + 1) / 2; i++)
+			memcpy(dst_chroma + i * surface->pitch,
+			       src + image->offsets[1] + i * image->pitches[1],
+			       chroma_row);
 	}
 
-	for (unsigned int i = 0; i < height; i++)
-		memcpy(dst_luma + i * surface->pitch,
-		       src + image->offsets[0] + i * image->pitches[0],
-		       luma_row);
-
-	for (unsigned int i = 0; i < (height + 1) / 2; i++)
-		memcpy(dst_chroma + i * surface->pitch,
-		       src + image->offsets[1] + i * image->pitches[1],
-		       chroma_row);
+	v4l2r_surface_cpu_end(drv, surface, DMA_BUF_SYNC_WRITE);
 
 	return VA_STATUS_SUCCESS;
 }

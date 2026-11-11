@@ -147,6 +147,9 @@ static int queue_capture_buffer(struct v4l2r_context *ctx, uint32_t index)
 	if (!surface->nb_planes)
 		return -EINVAL;
 
+	/* The decode writes over whatever the CPU last read of it. */
+	v4l2r_surface_device_wrote(ctx->drv, surface);
+
 	buffer.length = surface->nb_planes;
 	buffer.m.planes = planes;
 	for (unsigned int i = 0; i < surface->nb_planes; i++) {
