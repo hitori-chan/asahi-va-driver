@@ -48,7 +48,7 @@ sources = [
   'src/driver.c',
   'src/handles.c',
   'src/context.c',
-  'src/convert.c',
+  'src/vpp.c',
   'src/decode.c',
   'src/surface.c',
   'src/buffer.c',
