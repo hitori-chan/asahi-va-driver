@@ -24,15 +24,6 @@
 
 #include <va/va_dec_hevc.h>
 
-/*
- * Downstream Rockchip control carrying the full SPS short-term reference
- * picture set table (all st_ref_pic_set() definitions). Not always present in
- * the build headers; define the well-known id so we can probe for it.
- */
-#ifndef V4L2_CID_STATELESS_HEVC_EXT_SPS_ST_RPS
-#define V4L2_CID_STATELESS_HEVC_EXT_SPS_ST_RPS (V4L2_CID_CODEC_STATELESS_BASE + 408)
-#endif
-
 static const uint8_t annexb_start_code[3] = { 0x00, 0x00, 0x01 };
 
 #define HEVC_NAL_IDR_W_RADL	19
@@ -869,10 +860,6 @@ static VAStatus hevc_process_slice(struct v4l2r_context *ctx,
 			info.short_term_ref_pic_set_size;
 		codec->decode_params.long_term_ref_pic_set_size =
 			info.long_term_ref_pic_set_size;
-#if HAVE_HEVC_DECODE_PARAMS_NUM_DELTA_POCS
-		codec->decode_params.num_delta_pocs_of_ref_rps_idx =
-			info.num_delta_pocs_of_ref_rps_idx;
-#endif
 		if (info.no_output_of_prior_pics)
 			codec->decode_params.flags |=
 				V4L2_HEVC_DECODE_PARAM_FLAG_NO_OUTPUT_OF_PRIOR;
@@ -916,32 +903,11 @@ static VAStatus hevc_init(struct v4l2r_context *ctx)
 	struct v4l2_query_ext_ctrl slice_params = {
 		.id = V4L2_CID_STATELESS_HEVC_SLICE_PARAMS,
 	};
-	struct v4l2_query_ext_ctrl ext_sps_st_rps = {
-		.id = V4L2_CID_STATELESS_HEVC_EXT_SPS_ST_RPS,
-	};
 	struct v4l2_query_ext_ctrl entry_point_offsets = {
 		.id = V4L2_CID_STATELESS_HEVC_ENTRY_POINT_OFFSETS,
 	};
 	struct v4l2_ext_control controls[2];
 	int ret;
-
-	/*
-	 * Some decoders (Rockchip rkvdec2 / vdpu38x on e.g. RK3588) decode HEVC
-	 * fully statelessly and require the complete SPS short-term reference
-	 * picture set table via V4L2_CID_STATELESS_HEVC_EXT_SPS_ST_RPS; without
-	 * it they silently emit corrupted inter frames. That table is the raw
-	 * SPS st_ref_pic_set() syntax, which VA-API never exposes (the picture
-	 * parameter buffer only carries the set count) and which cannot be
-	 * reconstructed from the per-frame data we do get. If the decoder
-	 * advertises that control we cannot drive it correctly, so decline HEVC
-	 * here and let the caller fall back (to software, or to another decoder
-	 * once codec-to-device assignment is prioritised).
-	 */
-	if (!v4l2r_query_control(ctx, &ext_sps_st_rps)) {
-		v4l2r_log("hevc: decoder requires SPS RPS tables (EXT_SPS_ST_RPS) "
-			  "that VA-API cannot supply; declining HEVC\n");
-		return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
-	}
 
 	ret = v4l2r_query_control_default(ctx,
 			V4L2_CID_STATELESS_HEVC_DECODE_MODE, &codec->decode_mode);

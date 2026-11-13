@@ -34,11 +34,6 @@ foreach codec, ctrl : codec_checks
   conf.set10('HAVE_V4L2_CTRL_' + codec.to_upper(), have)
 endforeach
 
-conf.set10('HAVE_HEVC_DECODE_PARAMS_NUM_DELTA_POCS',
-           cc.has_member('struct v4l2_ctrl_hevc_decode_params',
-                         'num_delta_pocs_of_ref_rps_idx',
-                         prefix: '#include <linux/videodev2.h>'))
-
 configure_file(output: 'config.h', configuration: conf)
 root_inc = include_directories('.')
 
