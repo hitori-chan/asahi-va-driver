@@ -25,6 +25,7 @@
 
 #include "v4l2_request.h"
 #include "codec/codec.h"
+#include "vpp.h"
 
 static int set_format(struct v4l2r_context *ctx, enum v4l2_buf_type type,
 		      uint32_t pixelformat, uint32_t buffersize)
@@ -619,7 +620,7 @@ VAStatus v4l2r_CreateContext(VADriverContextP va_ctx, VAConfigID config_id,
 	/* Video processing contexts drive the format converter instead of a
 	 * decoder: no codec, no decoder device, no queues. */
 	if (!ctx->codec) {
-		status = v4l2r_vpp_create(ctx);
+		status = vpp_ctx_create(ctx);
 		if (status != VA_STATUS_SUCCESS)
 			goto fail;
 
@@ -797,7 +798,7 @@ VAStatus v4l2r_DestroyContext(VADriverContextP va_ctx, VAContextID context_id)
 		ioctl(ctx->video_fd, VIDIOC_STREAMOFF, &type);
 	}
 
-	v4l2r_vpp_destroy(ctx);
+	vpp_ctx_destroy(ctx);
 
 	for (unsigned int i = 0; i < V4L2R_OUTPUT_BUFFERS; i++)
 		output_buffer_cleanup(ctx, &ctx->output[i]);
@@ -853,7 +854,7 @@ VAStatus v4l2r_BeginPicture(VADriverContextP va_ctx, VAContextID context_id,
 		return VA_STATUS_ERROR_SURFACE_BUSY;
 
 	if (ctx->vpp)
-		return v4l2r_vpp_begin_picture(ctx, surface);
+		return vpp_ctx_begin_picture(ctx, surface);
 
 	status = v4l2r_picture_begin(ctx, surface);
 	if (status != VA_STATUS_SUCCESS)
@@ -887,7 +888,7 @@ VAStatus v4l2r_RenderPicture(VADriverContextP va_ctx, VAContextID context_id,
 		if (!buffer)
 			return VA_STATUS_ERROR_INVALID_BUFFER;
 
-		status = ctx->vpp ? v4l2r_vpp_render_buffer(ctx, buffer) :
+		status = ctx->vpp ? vpp_ctx_render_buffer(ctx, buffer) :
 			 ctx->codec->render_buffer(ctx, buffer);
 		if (status != VA_STATUS_SUCCESS)
 			return status;
@@ -908,7 +909,7 @@ VAStatus v4l2r_EndPicture(VADriverContextP va_ctx, VAContextID context_id)
 	if (!ctx->in_picture)
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 
-	status = ctx->vpp ? v4l2r_vpp_end_picture(ctx) :
+	status = ctx->vpp ? vpp_ctx_end_picture(ctx) :
 		 ctx->codec->end_picture(ctx);
 
 	ctx->in_picture = false;

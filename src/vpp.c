@@ -33,14 +33,12 @@
 #include <linux/videodev2.h>
 
 #include "v4l2_request.h"
+#include "vpp.h"
 
 #define V4L2R_CONVERT_TIMEOUT_MS 2000
 
-/* Dimension limits of the converter's crop/compose rectangles (the mainline
- * Rockchip RGA driver rejects anything smaller than 34 pixels and frames
- * larger than 8192). */
-#define V4L2R_VPP_MIN_DIM 34
-#define V4L2R_VPP_MAX_DIM 8192
+#define VPP_MIN_DIM 2
+#define VPP_MAX_DIM 65536
 
 /*
  * --- video processing (VAEntrypointVideoProc) ---
@@ -55,10 +53,10 @@
  * dma-buf to imported dma-buf.
  */
 
-VAStatus v4l2r_QueryVideoProcFilters(VADriverContextP va_ctx,
-				     VAContextID context_id,
-				     VAProcFilterType *filters,
-				     unsigned int *num_filters)
+static VAStatus queryVideoProcFilters(VADriverContextP va_ctx,
+				      VAContextID context_id,
+				      VAProcFilterType *filters,
+				      unsigned int *num_filters)
 {
 	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
 
@@ -73,11 +71,11 @@ VAStatus v4l2r_QueryVideoProcFilters(VADriverContextP va_ctx,
 	return VA_STATUS_SUCCESS;
 }
 
-VAStatus v4l2r_QueryVideoProcFilterCaps(VADriverContextP va_ctx,
-					VAContextID context_id,
-					VAProcFilterType type,
-					void *filter_caps,
-					unsigned int *num_filter_caps)
+static VAStatus queryVideoProcFilterCaps(VADriverContextP va_ctx,
+					 VAContextID context_id,
+					 VAProcFilterType type,
+					 void *filter_caps,
+					 unsigned int *num_filter_caps)
 {
 	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
 
@@ -91,19 +89,23 @@ VAStatus v4l2r_QueryVideoProcFilterCaps(VADriverContextP va_ctx,
 	return VA_STATUS_ERROR_UNSUPPORTED_FILTER;
 }
 
-VAStatus v4l2r_QueryVideoProcPipelineCaps(VADriverContextP va_ctx,
-					  VAContextID context_id,
-					  VABufferID *filters,
-					  unsigned int num_filters,
-					  VAProcPipelineCaps *pipeline_caps)
+static VAStatus queryVideoProcPipelineCaps(VADriverContextP va_ctx,
+					   VAContextID context_id,
+					   VABufferID *filters,
+					   unsigned int num_filters,
+					   VAProcPipelineCaps *pipeline_caps)
 {
 	/* Arrays the caps point into must outlive the call. */
 	static VAProcColorStandardType color_standards[] = {
 		VAProcColorStandardBT601,
 		VAProcColorStandardBT709,
+		VAProcColorStandardBT2020,
+		VAProcColorStandardSRGB,
+		VAProcColorStandardExplicit,
 	};
 	static uint32_t pixel_formats[] = {
 		VA_FOURCC_NV12,
+		VA_FOURCC_P010,
 	};
 	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
 
@@ -132,25 +134,27 @@ VAStatus v4l2r_QueryVideoProcPipelineCaps(VADriverContextP va_ctx,
 		pipeline_caps->num_input_color_standards;
 
 	pipeline_caps->input_pixel_format = pixel_formats;
-	pipeline_caps->num_input_pixel_formats = 1;
+	pipeline_caps->num_input_pixel_formats =
+		sizeof(pixel_formats) / sizeof(pixel_formats[0]);
 	pipeline_caps->output_pixel_format = pixel_formats;
-	pipeline_caps->num_output_pixel_formats = 1;
+	pipeline_caps->num_output_pixel_formats =
+		sizeof(pixel_formats) / sizeof(pixel_formats[0]);
 
-	pipeline_caps->min_input_width = V4L2R_VPP_MIN_DIM;
-	pipeline_caps->min_input_height = V4L2R_VPP_MIN_DIM;
-	pipeline_caps->max_input_width = V4L2R_VPP_MAX_DIM;
-	pipeline_caps->max_input_height = V4L2R_VPP_MAX_DIM;
-	pipeline_caps->min_output_width = V4L2R_VPP_MIN_DIM;
-	pipeline_caps->min_output_height = V4L2R_VPP_MIN_DIM;
-	pipeline_caps->max_output_width = V4L2R_VPP_MAX_DIM;
-	pipeline_caps->max_output_height = V4L2R_VPP_MAX_DIM;
+	pipeline_caps->min_input_width = VPP_MIN_DIM;
+	pipeline_caps->min_input_height = VPP_MIN_DIM;
+	pipeline_caps->max_input_width = VPP_MAX_DIM;
+	pipeline_caps->max_input_height = VPP_MAX_DIM;
+	pipeline_caps->min_output_width = VPP_MIN_DIM;
+	pipeline_caps->min_output_height = VPP_MIN_DIM;
+	pipeline_caps->max_output_width = VPP_MAX_DIM;
+	pipeline_caps->max_output_height = VPP_MAX_DIM;
 
 	return VA_STATUS_SUCCESS;
 }
 
-VAStatus v4l2r_vpp_create(struct v4l2r_context *ctx)
+VAStatus vpp_ctx_create(struct v4l2r_context *ctx)
 {
-	if (!v4l2r_converter_available(ctx->drv))
+	if (!ctx->drv->has_converter)
 		return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
 
 	ctx->vpp = calloc(1, sizeof(*ctx->vpp));
@@ -161,7 +165,7 @@ VAStatus v4l2r_vpp_create(struct v4l2r_context *ctx)
 	return VA_STATUS_SUCCESS;
 }
 
-static void vpp_teardown(struct v4l2r_vpp *vpp)
+static void vpp_teardown(struct vpp_ctx *vpp)
 {
 	if (vpp->fd >= 0) {
 		close(vpp->fd);
@@ -169,7 +173,7 @@ static void vpp_teardown(struct v4l2r_vpp *vpp)
 	}
 }
 
-void v4l2r_vpp_destroy(struct v4l2r_context *ctx)
+void vpp_ctx_destroy(struct v4l2r_context *ctx)
 {
 	if (!ctx->vpp)
 		return;
@@ -179,8 +183,8 @@ void v4l2r_vpp_destroy(struct v4l2r_context *ctx)
 	ctx->vpp = NULL;
 }
 
-VAStatus v4l2r_vpp_begin_picture(struct v4l2r_context *ctx,
-				 struct v4l2r_surface *target)
+VAStatus vpp_ctx_begin_picture(struct v4l2r_context *ctx,
+			       struct v4l2r_surface *target)
 {
 	ctx->pic.target = target;
 	ctx->in_picture = true;
@@ -189,10 +193,10 @@ VAStatus v4l2r_vpp_begin_picture(struct v4l2r_context *ctx,
 	return VA_STATUS_SUCCESS;
 }
 
-VAStatus v4l2r_vpp_render_buffer(struct v4l2r_context *ctx,
-				 struct v4l2r_buffer *buf)
+VAStatus vpp_ctx_render_buffer(struct v4l2r_context *ctx,
+			       struct v4l2r_buffer *buf)
 {
-	struct v4l2r_vpp *vpp = ctx->vpp;
+	struct vpp_ctx *vpp = ctx->vpp;
 	struct v4l2r_surface *target = ctx->pic.target;
 	const VAProcPipelineParameterBuffer *params;
 	struct v4l2r_surface *surface;
@@ -240,8 +244,8 @@ static bool vpp_region_valid(const VARectangle *region,
 			     uint32_t width, uint32_t height)
 {
 	return region->x >= 0 && region->y >= 0 &&
-	       region->width >= V4L2R_VPP_MIN_DIM &&
-	       region->height >= V4L2R_VPP_MIN_DIM &&
+	       region->width >= VPP_MIN_DIM &&
+	       region->height >= VPP_MIN_DIM &&
 	       (uint32_t)region->x + region->width <= width &&
 	       (uint32_t)region->y + region->height <= height;
 }
@@ -324,13 +328,14 @@ static VAStatus vpp_configure(struct v4l2r_context *ctx,
 			      const struct v4l2r_surface *src,
 			      const struct v4l2r_surface *dst)
 {
-	struct v4l2r_vpp *vpp = ctx->vpp;
+	struct vpp_ctx *vpp = ctx->vpp;
 	struct v4l2r_driver *drv = ctx->drv;
 	struct v4l2_requestbuffers reqbufs;
 	enum v4l2_buf_type type;
 
 	if (vpp->fd >= 0 &&
 	    vpp->src_pixelformat == src->pixelformat &&
+	    vpp->dst_pixelformat == dst->pixelformat &&
 	    vpp->src_width == src->width && vpp->src_height == src->height &&
 	    vpp->src_pitch == src->pitch &&
 	    vpp->dst_width == dst->width && vpp->dst_height == dst->height &&
@@ -347,11 +352,12 @@ static VAStatus vpp_configure(struct v4l2r_context *ctx,
 			   src->pixelformat, src->width, src->height,
 			   src->pitch, &vpp->output_format) < 0 ||
 	    vpp_set_format(vpp->fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-			   V4L2_PIX_FMT_NV12, dst->width, dst->height,
+			   dst->pixelformat, dst->width, dst->height,
 			   dst->pitch, &vpp->capture_format) < 0) {
-		v4l2r_log("converter cannot process %.4s %ux%u to NV12 %ux%u\n",
+		v4l2r_log("converter cannot process %.4s %ux%u to %.4s %ux%u\n",
 			  (const char *)&src->pixelformat, src->width,
-			  src->height, dst->width, dst->height);
+			  src->height, (const char *)&src->pixelformat,
+			  dst->width, dst->height);
 		goto fail;
 	}
 
@@ -384,6 +390,7 @@ static VAStatus vpp_configure(struct v4l2r_context *ctx,
 		goto fail;
 
 	vpp->src_pixelformat = src->pixelformat;
+	vpp->dst_pixelformat = dst->pixelformat;
 	vpp->src_width = src->width;
 	vpp->src_height = src->height;
 	vpp->src_pitch = src->pitch;
@@ -391,10 +398,10 @@ static VAStatus vpp_configure(struct v4l2r_context *ctx,
 	vpp->dst_height = dst->height;
 	vpp->dst_pitch = dst->pitch;
 
-	v4l2r_log("processing %.4s %ux%u to NV12 %ux%u via %s [%s]\n",
+	v4l2r_log("processing %.4s %ux%u to %.4s %ux%u via %s [%s]\n",
 		  (const char *)&src->pixelformat, src->width, src->height,
-		  dst->width, dst->height, drv->converter.video_path,
-		  drv->converter.card);
+		  (const char *)&dst->pixelformat, dst->width, dst->height,
+		  drv->converter.video_path, drv->converter.card);
 
 	return VA_STATUS_SUCCESS;
 
@@ -404,7 +411,7 @@ fail:
 }
 
 /* Queue the source and destination dma-bufs and wait the job out. */
-static VAStatus vpp_run(struct v4l2r_vpp *vpp,
+static VAStatus vpp_run(struct vpp_ctx *vpp,
 			const struct v4l2r_surface *src,
 			const struct v4l2r_surface *dst)
 {
@@ -472,9 +479,9 @@ static VAStatus vpp_run(struct v4l2r_vpp *vpp,
 	return VA_STATUS_SUCCESS;
 }
 
-VAStatus v4l2r_vpp_end_picture(struct v4l2r_context *ctx)
+VAStatus vpp_ctx_end_picture(struct v4l2r_context *ctx)
 {
-	struct v4l2r_vpp *vpp = ctx->vpp;
+	struct vpp_ctx *vpp = ctx->vpp;
 	struct v4l2r_surface *src = vpp->src_surface;
 	struct v4l2r_surface *dst = ctx->pic.target;
 	VAStatus status;
@@ -488,25 +495,18 @@ VAStatus v4l2r_vpp_end_picture(struct v4l2r_context *ctx)
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 
-	/* Behind a conversion chain, read the raw decoder output (packed
-	 * 10-bit NV15) instead of the converted backing: the rotation and
-	 * the downconversion then happen in the same pass. Only without a
-	 * horizontal crop offset - the converter addresses crop columns in
-	 * whole bytes, which cannot land mid-byte in packed 10-bit layouts. */
 	status = v4l2r_surface_prepare(ctx->drv, src, false);
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 
-	if (src->nb_planes != 1 ||
-	    !v4l2r_converter_supports(ctx->drv, src->pixelformat))
+	if (src->nb_planes != 1)
 		return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
 
 	status = v4l2r_surface_prepare(ctx->drv, dst, false);
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 
-	if (dst->nb_planes != 1 ||
-	    dst->pixelformat != V4L2_PIX_FMT_NV12)
+	if (dst->nb_planes != 1)
 		return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
 
 	/* The source region is in pre-rotation coordinates (the converter
@@ -552,4 +552,11 @@ done:
 	pthread_mutex_unlock(&ctx->mutex);
 
 	return status;
+}
+
+void vpp_fill_vtable(struct VADriverVTableVPP *vtable)
+{
+	vtable->vaQueryVideoProcFilters = queryVideoProcFilters;
+	vtable->vaQueryVideoProcFilterCaps = queryVideoProcFilterCaps;
+	vtable->vaQueryVideoProcPipelineCaps = queryVideoProcPipelineCaps;
 }

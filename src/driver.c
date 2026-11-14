@@ -25,9 +25,7 @@
 
 #include "v4l2_request.h"
 #include "codec/codec.h"
-
-/* Needs the va.h types pulled in by v4l2_request.h. */
-#include <va/va_backend_vpp.h>
+#include "vpp.h"
 
 void v4l2r_log(const char *fmt, ...)
 {
@@ -370,19 +368,13 @@ static void enumerate_decoders(struct v4l2r_driver *drv)
 	}
 }
 
-/*
- * A usable format converter is a plain (non-request) mem2mem device that
- * can read at least one decoder-only CAPTURE format and write NV12, e.g.
- * the Rockchip RGA reading packed 10-bit NV15.
- */
+/* A usable format converter is a plain (non-request) mem2mem device */
 static bool video_device_is_converter(const char *path,
 				      struct v4l2r_converter *conv)
 {
 	struct v4l2_capability capability = {0};
 	struct v4l2_fmtdesc fmtdesc = {0};
 	unsigned int capabilities;
-	bool nv12_capture = false;
-	bool src_convertible = false;
 	int fd;
 
 	fd = open(path, O_RDWR | O_NONBLOCK);
@@ -414,35 +406,24 @@ static bool video_device_is_converter(const char *path,
 
 		/* Only useful if it reads a format we cannot hand out. */
 		if (info && !info->va_fourcc)
-			src_convertible = true;
+			goto ok;
 
 		fmtdesc.index++;
 	}
 
-	memset(&fmtdesc, 0, sizeof(fmtdesc));
-	fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-	while (ioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc) >= 0) {
-		if (fmtdesc.pixelformat == V4L2_PIX_FMT_NV12) {
-			nv12_capture = true;
-			break;
-		}
-		fmtdesc.index++;
-	}
+	goto fail;
 
+ok:
 	close(fd);
-	return src_convertible && nv12_capture;
+	return true;
 
 fail:
 	close(fd);
 	return false;
 }
 
-/* Called lazily via v4l2r_converter_available(), with drv->mutex held. */
 static void enumerate_converters(struct v4l2r_driver *drv)
 {
-	if (getenv("V4L2R_NO_CONVERT"))
-		return;
-
 	for (int i = 0; i < 64; i++) {
 		char video_path[32];
 		bool is_decoder = false;
@@ -470,37 +451,6 @@ static void enumerate_converters(struct v4l2r_driver *drv)
 			  video_path, drv->converter.card);
 		return;
 	}
-}
-
-/*
- * Probe for a converter on first use. Scanning the video device nodes
- * costs a few dozen opens/ioctls, so it is deferred until something can
- * actually use the result: plain 8-bit playback and vainfo never trigger
- * it.
- */
-bool v4l2r_converter_available(struct v4l2r_driver *drv)
-{
-	pthread_mutex_lock(&drv->mutex);
-	if (!drv->converter_probed) {
-		enumerate_converters(drv);
-		drv->converter_probed = true;
-	}
-	pthread_mutex_unlock(&drv->mutex);
-
-	return drv->has_converter;
-}
-
-bool v4l2r_converter_supports(struct v4l2r_driver *drv, uint32_t pixelformat)
-{
-	if (!v4l2r_converter_available(drv))
-		return false;
-
-	for (unsigned int i = 0; i < drv->converter.nb_pixelformats; i++) {
-		if (drv->converter.pixelformats[i] == pixelformat)
-			return true;
-	}
-
-	return false;
 }
 
 static bool driver_supports_pixelformat(struct v4l2r_driver *drv,
@@ -571,7 +521,7 @@ VAStatus v4l2r_QueryConfigEntrypoints(VADriverContextP va_ctx, VAProfile profile
 
 	if (profile == VAProfileNone) {
 		*num_entrypoints = 0;
-		if (v4l2r_converter_available(drv))
+		if (drv->has_converter)
 			entrypoints[(*num_entrypoints)++] =
 				VAEntrypointVideoProc;
 	} else if (codec && driver_supports_profile(drv, profile)) {
@@ -596,8 +546,7 @@ VAStatus v4l2r_CreateConfig(VADriverContextP va_ctx, VAProfile profile,
 	if (profile == VAProfileNone) {
 		/* Video processing (rotation/mirroring/scaling blits) runs
 		 * on the format converter. */
-		if (entrypoint != VAEntrypointVideoProc ||
-		    !v4l2r_converter_available(drv))
+		if (entrypoint != VAEntrypointVideoProc || !drv->has_converter)
 			return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
 	} else {
 		codec = v4l2r_codec_for_profile(profile);
@@ -855,14 +804,8 @@ VAStatus V4L2R_DRIVER_INIT(VADriverContextP va_ctx)
 	vtable->vaGetDisplayAttributes = v4l2r_GetDisplayAttributes;
 	vtable->vaSetDisplayAttributes = v4l2r_SetDisplayAttributes;
 
-	if (va_ctx->vtable_vpp) {
-		va_ctx->vtable_vpp->vaQueryVideoProcFilters =
-			v4l2r_QueryVideoProcFilters;
-		va_ctx->vtable_vpp->vaQueryVideoProcFilterCaps =
-			v4l2r_QueryVideoProcFilterCaps;
-		va_ctx->vtable_vpp->vaQueryVideoProcPipelineCaps =
-			v4l2r_QueryVideoProcPipelineCaps;
-	}
+	if (va_ctx->vtable_vpp)
+		vpp_fill_vtable(va_ctx->vtable_vpp);
 
 	drv = calloc(1, sizeof(*drv));
 	if (!drv)
@@ -891,6 +834,8 @@ VAStatus V4L2R_DRIVER_INIT(VADriverContextP va_ctx)
 		v4l2r_Terminate(va_ctx);
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 	}
+
+	enumerate_converters(drv);
 
 	v4l2r_log("detected %u Request API decoder%s\n", drv->nb_decoders,
 		  drv->nb_decoders == 1 ? "" : "s");

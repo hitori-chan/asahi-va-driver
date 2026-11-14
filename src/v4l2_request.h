@@ -34,7 +34,6 @@
 
 #include <va/va.h>
 #include <va/va_backend.h>
-#include <va/va_vpp.h>
 
 #include "config.h"
 
@@ -79,6 +78,7 @@ static inline uint64_t v4l2r_now_ns(void)
 struct v4l2r_driver;
 struct v4l2r_context;
 struct v4l2r_codec;
+struct vpp_ctx;
 
 void v4l2r_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void v4l2r_trace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -268,7 +268,7 @@ struct v4l2r_context {
 
 	/* Video processing state for VAEntrypointVideoProc contexts; such
 	 * contexts have no codec, decoder device or queues. See convert.c. */
-	struct v4l2r_vpp *vpp;
+	struct vpp_ctx *vpp;
 };
 
 /* Submit any decode a codec is holding back for this surface (no-op unless
@@ -285,11 +285,7 @@ struct v4l2r_driver {
 
 	struct v4l2r_decoder decoders[V4L2R_MAX_DECODERS];
 	unsigned int nb_decoders;
-
-	/* Converter detection is deferred until something can actually use
-	 * one (see v4l2r_converter_available). */
 	struct v4l2r_converter converter;
-	bool converter_probed;
 	bool has_converter;
 };
 
@@ -421,66 +417,6 @@ VAStatus v4l2r_context_bind_surface(struct v4l2r_context *ctx,
 
 /* Return a destroyed surface's CAPTURE buffer to the orphan free list. */
 void v4l2r_context_release_capture(struct v4l2r_context *ctx, int index);
-
-/* --- format converter chain (convert.c) --- */
-
-/* Whether a usable format converter exists, probing the device nodes on
- * the first call. Only invoked when a converter could actually matter
- * (10-bit configs, undisplayable CAPTURE formats), so plain 8-bit clients
- * never pay for the scan. */
-bool v4l2r_converter_available(struct v4l2r_driver *drv);
-
-/* Whether the detected converter can read this pixelformat. */
-bool v4l2r_converter_supports(struct v4l2r_driver *drv, uint32_t pixelformat);
-
-/* --- video processing (convert.c) --- */
-
-/* Per-context state of a VAEntrypointVideoProc context: rotation, mirroring
- * and scaling blits between surfaces, run on the format converter. */
-struct v4l2r_vpp {
-	int fd;				/* configured converter, -1 until first blit */
-	struct v4l2_format output_format;	/* source */
-	struct v4l2_format capture_format;	/* destination, NV12 */
-
-	/* Geometry the converter is currently configured for; a change in
-	 * any of these forces a reconfiguration (V4L2 formats cannot change
-	 * while buffers are allocated). */
-	uint32_t src_pixelformat;
-	uint32_t src_width, src_height, src_pitch;
-	uint32_t dst_width, dst_height, dst_pitch;
-
-	/* Pipeline parameters of the picture being assembled. */
-	struct v4l2r_surface *src_surface;
-	VARectangle src_region;
-	VARectangle dst_region;
-	uint32_t rotation;		/* VA_ROTATION_* */
-	uint32_t mirror;		/* VA_MIRROR_* mask */
-	bool have_params;
-};
-
-VAStatus v4l2r_vpp_create(struct v4l2r_context *ctx);
-void v4l2r_vpp_destroy(struct v4l2r_context *ctx);
-
-VAStatus v4l2r_vpp_begin_picture(struct v4l2r_context *ctx,
-				 struct v4l2r_surface *target);
-VAStatus v4l2r_vpp_render_buffer(struct v4l2r_context *ctx,
-				 struct v4l2r_buffer *buf);
-VAStatus v4l2r_vpp_end_picture(struct v4l2r_context *ctx);
-
-VAStatus v4l2r_QueryVideoProcFilters(VADriverContextP va_ctx,
-				     VAContextID context_id,
-				     VAProcFilterType *filters,
-				     unsigned int *num_filters);
-VAStatus v4l2r_QueryVideoProcFilterCaps(VADriverContextP va_ctx,
-					VAContextID context_id,
-					VAProcFilterType type,
-					void *filter_caps,
-					unsigned int *num_filter_caps);
-VAStatus v4l2r_QueryVideoProcPipelineCaps(VADriverContextP va_ctx,
-					  VAContextID context_id,
-					  VABufferID *filters,
-					  unsigned int num_filters,
-					  VAProcPipelineCaps *pipeline_caps);
 
 /* --- surface helpers (surface.c) --- */
 
