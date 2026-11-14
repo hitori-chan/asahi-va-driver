@@ -53,6 +53,152 @@
  * dma-buf to imported dma-buf.
  */
 
+static enum v4l2_colorspace h273_to_v4l2_colorspace(uint8_t colour_primaries)
+{
+	switch (colour_primaries) {
+	case 1: return V4L2_COLORSPACE_REC709;
+	case 4: return V4L2_COLORSPACE_470_SYSTEM_M;
+	case 5: return V4L2_COLORSPACE_470_SYSTEM_BG;
+	case 6: return V4L2_COLORSPACE_SMPTE170M;
+	case 7: return V4L2_COLORSPACE_SMPTE240M;
+	case 9: return V4L2_COLORSPACE_BT2020;
+	case 11:
+	case 12: return V4L2_COLORSPACE_DCI_P3;
+	default: return V4L2_COLORSPACE_DEFAULT;
+	}
+}
+
+static enum v4l2_xfer_func
+h273_to_v4l2_xfer_func(uint8_t transfer_characteristics)
+{
+	switch (transfer_characteristics) {
+	case 1:
+	case 6:
+	case 14:
+	case 15: return V4L2_XFER_FUNC_709;
+	case 7: return V4L2_XFER_FUNC_SMPTE240M;
+	case 8: return V4L2_XFER_FUNC_NONE;
+	case 13: return V4L2_XFER_FUNC_SRGB;
+	case 16: return V4L2_XFER_FUNC_SMPTE2084;
+	case 17: return V4L2_XFER_FUNC_DCI_P3; /* not exactly?? */
+	default: return V4L2_XFER_FUNC_DEFAULT;
+	}
+}
+
+static enum v4l2_ycbcr_encoding
+h273_to_v4l2_ycbcr_encoding(uint8_t matrix_coefficients)
+{
+	switch (matrix_coefficients) {
+	case 1: return V4L2_YCBCR_ENC_709;
+	case 5:
+	case 6: return V4L2_YCBCR_ENC_601;
+	case 7: return V4L2_YCBCR_ENC_SMPTE240M;
+	case 9: return V4L2_YCBCR_ENC_BT2020;
+	case 10: return V4L2_YCBCR_ENC_BT2020_CONST_LUM;
+	default: return V4L2_YCBCR_ENC_DEFAULT;
+	}
+}
+
+static enum v4l2_quantization va_range_to_v4l2_quantization(uint8_t color_range)
+{
+	switch (color_range) {
+	case VA_SOURCE_RANGE_REDUCED: return V4L2_QUANTIZATION_LIM_RANGE;
+	case VA_SOURCE_RANGE_FULL: return V4L2_QUANTIZATION_FULL_RANGE;
+	default: return V4L2_QUANTIZATION_DEFAULT;
+	}
+}
+
+static void vpp_fill_colorimetry(struct vpp_colorimetry *cm,
+				 VAProcColorStandardType standard,
+				 const VAProcColorProperties *props)
+{
+	enum v4l2_quantization q = V4L2_QUANTIZATION_DEFAULT;
+	enum v4l2_ycbcr_encoding enc = V4L2_YCBCR_ENC_DEFAULT;
+	enum v4l2_colorspace cs = V4L2_COLORSPACE_DEFAULT;
+	enum v4l2_xfer_func xf = V4L2_XFER_FUNC_DEFAULT;
+	uint8_t colour_primaries = 0, transfer_characteristics = 0;
+	uint8_t matrix_coefficients = 0;
+
+	switch (standard) {
+	case VAProcColorStandardExplicit:
+		colour_primaries = props->colour_primaries;
+		transfer_characteristics = props->transfer_characteristics;
+		matrix_coefficients = props->matrix_coefficients;
+		break;
+	case VAProcColorStandardBT601:
+		colour_primaries = 5;
+		transfer_characteristics = 6;
+		matrix_coefficients = 5;
+		break;
+	case VAProcColorStandardBT709:
+		colour_primaries = 1;
+		transfer_characteristics = 1;
+		matrix_coefficients = 1;
+		break;
+	case VAProcColorStandardBT470M:
+		colour_primaries = 4;
+		transfer_characteristics = 4;
+		matrix_coefficients = 4;
+		break;
+	case VAProcColorStandardBT470BG:
+		colour_primaries = 5;
+		transfer_characteristics = 5;
+		matrix_coefficients = 5;
+		break;
+	case VAProcColorStandardSMPTE170M:
+		colour_primaries = 6;
+		transfer_characteristics = 6;
+		matrix_coefficients = 6;
+		break;
+	case VAProcColorStandardSMPTE240M:
+		colour_primaries = 7;
+		transfer_characteristics = 7;
+		matrix_coefficients = 7;
+		break;
+	case VAProcColorStandardGenericFilm:
+		colour_primaries = 8;
+		transfer_characteristics = 1;
+		matrix_coefficients = 1;
+		break;
+	case VAProcColorStandardSRGB:
+		colour_primaries = 1;
+		transfer_characteristics = 13;
+		matrix_coefficients = 0;
+		break;
+	case VAProcColorStandardXVYCC601:
+		colour_primaries = 1;
+		transfer_characteristics = 11;
+		matrix_coefficients = 5;
+		break;
+	case VAProcColorStandardXVYCC709:
+		colour_primaries = 1;
+		transfer_characteristics = 11;
+		matrix_coefficients = 1;
+		break;
+	case VAProcColorStandardBT2020:
+		colour_primaries = 9;
+		transfer_characteristics = 14;
+		matrix_coefficients = 9;
+		break;
+	default: break;
+	}
+
+	cs = h273_to_v4l2_colorspace(colour_primaries);
+	enc = h273_to_v4l2_ycbcr_encoding(matrix_coefficients);
+	xf = h273_to_v4l2_xfer_func(transfer_characteristics);
+	q = va_range_to_v4l2_quantization(props->color_range);
+
+	if (q == cm->quantization && enc == cm->ycbcr_enc &&
+	    cs == cm->colorspace && xf == cm->xfer_func)
+		return;
+
+	cm->changed = true;
+	cm->quantization = q;
+	cm->colorspace = cs;
+	cm->xfer_func = xf;
+	cm->ycbcr_enc = enc;
+}
+
 static VAStatus queryVideoProcFilters(VADriverContextP va_ctx,
 				      VAContextID context_id,
 				      VAProcFilterType *filters,
@@ -222,19 +368,27 @@ VAStatus vpp_ctx_render_buffer(struct v4l2r_context *ctx,
 	 * (defaulted to the full surfaces) for vaEndPicture(). */
 	vpp->src_surface = surface;
 	if (params->surface_region)
-		vpp->src_region = *params->surface_region;
+		vpp->src.region = *params->surface_region;
 	else
-		vpp->src_region = (VARectangle) {
+		vpp->src.region = (VARectangle) {
 			0, 0, surface->width, surface->height,
 		};
 	if (params->output_region)
-		vpp->dst_region = *params->output_region;
+		vpp->dst.region = *params->output_region;
 	else
-		vpp->dst_region = (VARectangle) {
+		vpp->dst.region = (VARectangle) {
 			0, 0, target->width, target->height,
 		};
 	vpp->rotation = params->rotation_state;
 	vpp->mirror = params->mirror_state;
+
+	vpp_fill_colorimetry(&vpp->src.colorimetry,
+			     params->surface_color_standard,
+			     &params->input_color_properties);
+	vpp_fill_colorimetry(&vpp->dst.colorimetry,
+			     params->output_color_standard,
+			     &params->output_color_properties);
+
 	vpp->have_params = true;
 
 	return VA_STATUS_SUCCESS;
@@ -258,25 +412,40 @@ static bool vpp_region_valid(const VARectangle *region,
  * area is confined by the crop/compose rectangle, not the format.
  */
 static int vpp_set_format(int fd, enum v4l2_buf_type type,
-			  uint32_t pixelformat, uint32_t width,
-			  uint32_t height, uint32_t pitch,
+			  struct vpp_fmt *fmt,
+			  struct vpp_colorimetry *cm,
 			  struct v4l2_format *format)
 {
+	uint32_t width = fmt->width;
+
 	for (unsigned int attempt = 0; attempt < 2; attempt++) {
-		*format = (struct v4l2_format) { .type = type };
-		format->fmt.pix_mp.pixelformat = pixelformat;
-		format->fmt.pix_mp.width = width;
-		format->fmt.pix_mp.height = height;
-		format->fmt.pix_mp.num_planes = 1;
+		*format = (struct v4l2_format) {
+			.type = type,
+			.fmt.pix_mp = {
+				.pixelformat = fmt->pixfmt,
+				.width = width,
+				.height = fmt->height,
+				.num_planes = 1,
+				.colorspace = cm->colorspace,
+				.quantization = cm->quantization,
+				.xfer_func = cm->xfer_func,
+				.ycbcr_enc = cm->ycbcr_enc,
+			}
+		};
+
+		if (cm->xfer_func || cm->ycbcr_enc || cm->colorspace ||
+		    cm->quantization)
+			format->fmt.pix_mp.flags |= V4L2_PIX_FMT_FLAG_SET_CSC;
+
 		if (ioctl(fd, VIDIOC_S_FMT, format) < 0)
 			return -errno;
 
-		if (format->fmt.pix_mp.pixelformat != pixelformat ||
-		    format->fmt.pix_mp.height != height ||
+		if (format->fmt.pix_mp.pixelformat != fmt->pixfmt ||
+		    format->fmt.pix_mp.height != fmt->height ||
 		    format->fmt.pix_mp.num_planes != 1)
 			return -EINVAL;
 
-		if (format->fmt.pix_mp.plane_fmt[0].bytesperline == pitch)
+		if (format->fmt.pix_mp.plane_fmt[0].bytesperline == fmt->pitch)
 			return 0;
 
 		if (attempt || !format->fmt.pix_mp.plane_fmt[0].bytesperline)
@@ -284,7 +453,7 @@ static int vpp_set_format(int fd, enum v4l2_buf_type type,
 
 		/* Stride scales linearly with the width for the packed
 		 * single-plane YUV formats used here. */
-		width = (uint32_t)((uint64_t)width * pitch /
+		width = (uint32_t)((uint64_t)width * fmt->pitch /
 				   format->fmt.pix_mp.plane_fmt[0].bytesperline);
 	}
 
@@ -332,14 +501,19 @@ static VAStatus vpp_configure(struct v4l2r_context *ctx,
 	struct v4l2r_driver *drv = ctx->drv;
 	struct v4l2_requestbuffers reqbufs;
 	enum v4l2_buf_type type;
+	struct vpp_fmt src_fmt;
+	struct vpp_fmt dst_fmt;
 
 	if (vpp->fd >= 0 &&
-	    vpp->src_pixelformat == src->pixelformat &&
-	    vpp->dst_pixelformat == dst->pixelformat &&
-	    vpp->src_width == src->width && vpp->src_height == src->height &&
-	    vpp->src_pitch == src->pitch &&
-	    vpp->dst_width == dst->width && vpp->dst_height == dst->height &&
-	    vpp->dst_pitch == dst->pitch)
+	    !vpp->src.colorimetry.changed && !vpp->dst.colorimetry.changed &&
+	    vpp->src.fmt.pixfmt == src->pixelformat &&
+	    vpp->dst.fmt.pixfmt == dst->pixelformat &&
+	    vpp->src.fmt.width == src->width &&
+	    vpp->src.fmt.height == src->height &&
+	    vpp->src.fmt.pitch == src->pitch &&
+	    vpp->dst.fmt.width == dst->width &&
+	    vpp->dst.fmt.height == dst->height &&
+	    vpp->dst.fmt.pitch == dst->pitch)
 		return VA_STATUS_SUCCESS;
 
 	vpp_teardown(vpp);
@@ -348,16 +522,31 @@ static VAStatus vpp_configure(struct v4l2r_context *ctx,
 	if (vpp->fd < 0)
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 
+	src_fmt.pixfmt = src->pixelformat;
+	src_fmt.width = src->width;
+	src_fmt.height = src->height;
+	src_fmt.pitch = src->pitch;
+
 	if (vpp_set_format(vpp->fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
-			   src->pixelformat, src->width, src->height,
-			   src->pitch, &vpp->output_format) < 0 ||
-	    vpp_set_format(vpp->fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-			   dst->pixelformat, dst->width, dst->height,
-			   dst->pitch, &vpp->capture_format) < 0) {
-		v4l2r_log("converter cannot process %.4s %ux%u to %.4s %ux%u\n",
+			   &src_fmt, &vpp->src.colorimetry,
+			   &vpp->output_format) < 0) {
+		v4l2r_log("vpp: failed to set src to %.4s %ux%u\n",
 			  (const char *)&src->pixelformat, src->width,
-			  src->height, (const char *)&src->pixelformat,
-			  dst->width, dst->height);
+			  src->height);
+		goto fail;
+	}
+
+	dst_fmt.pixfmt = dst->pixelformat;
+	dst_fmt.width = dst->width;
+	dst_fmt.height = dst->height;
+	dst_fmt.pitch = dst->pitch;
+
+	if (vpp_set_format(vpp->fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+			   &dst_fmt, &vpp->dst.colorimetry,
+			   &vpp->capture_format) < 0) {
+		v4l2r_log("vpp: failed to set src to %.4s %ux%u\n",
+			  (const char *)&dst->pixelformat, dst->width,
+			  dst->height);
 		goto fail;
 	}
 
@@ -389,14 +578,11 @@ static VAStatus vpp_configure(struct v4l2r_context *ctx,
 	if (ioctl(vpp->fd, VIDIOC_STREAMON, &type) < 0)
 		goto fail;
 
-	vpp->src_pixelformat = src->pixelformat;
-	vpp->dst_pixelformat = dst->pixelformat;
-	vpp->src_width = src->width;
-	vpp->src_height = src->height;
-	vpp->src_pitch = src->pitch;
-	vpp->dst_width = dst->width;
-	vpp->dst_height = dst->height;
-	vpp->dst_pitch = dst->pitch;
+	vpp->src.fmt = src_fmt;
+	vpp->dst.fmt = dst_fmt;
+
+	vpp->src.colorimetry.changed = false;
+	vpp->dst.colorimetry.changed = false;
 
 	v4l2r_log("processing %.4s %ux%u to %.4s %ux%u via %s [%s]\n",
 		  (const char *)&src->pixelformat, src->width, src->height,
@@ -512,9 +698,9 @@ VAStatus vpp_ctx_end_picture(struct v4l2r_context *ctx)
 	/* The source region is in pre-rotation coordinates (the converter
 	 * crops the source), the output region in destination coordinates
 	 * (it composes into the destination) - both as VA-API defines them. */
-	if (!vpp_region_valid(&vpp->src_region, src->width,
+	if (!vpp_region_valid(&vpp->src.region, src->width,
 			      src->height) ||
-	    !vpp_region_valid(&vpp->dst_region, dst->width,
+	    !vpp_region_valid(&vpp->dst.region, dst->width,
 			      dst->height))
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
 
@@ -534,9 +720,9 @@ VAStatus vpp_ctx_end_picture(struct v4l2r_context *ctx)
 	    vpp_set_control(vpp->fd, V4L2_CID_VFLIP,
 			    !!(vpp->mirror & VA_MIRROR_VERTICAL)) < 0 ||
 	    vpp_set_rect(vpp->fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
-			 V4L2_SEL_TGT_CROP, &vpp->src_region) < 0 ||
+			 V4L2_SEL_TGT_CROP, &vpp->src.region) < 0 ||
 	    vpp_set_rect(vpp->fd, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-			 V4L2_SEL_TGT_COMPOSE, &vpp->dst_region) < 0) {
+			 V4L2_SEL_TGT_COMPOSE, &vpp->dst.region) < 0) {
 		status = VA_STATUS_ERROR_OPERATION_FAILED;
 		goto done;
 	}

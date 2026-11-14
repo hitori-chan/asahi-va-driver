@@ -19,22 +19,40 @@ struct v4l2r_context;
 struct v4l2r_buffer;
 struct v4l2r_surface;
 
+struct vpp_colorimetry {
+	enum v4l2_colorspace colorspace;
+	enum v4l2_ycbcr_encoding ycbcr_enc;
+	enum v4l2_quantization quantization;
+	enum v4l2_xfer_func xfer_func;
+	bool changed;
+};
+
+struct vpp_fmt {
+	uint32_t pixfmt;
+	uint32_t width;
+	uint32_t height;
+	uint32_t pitch;
+};
+
+struct vpp_config {
+	VARectangle region;
+
+	/* a change in any of these forces a reconfiguration */
+	struct v4l2_format format;
+	struct vpp_fmt fmt;
+	struct vpp_colorimetry colorimetry;
+};
+
 struct vpp_ctx {
 	int fd;				/* configured converter, -1 until first blit */
 	struct v4l2_format output_format;	/* source */
 	struct v4l2_format capture_format;	/* destination */
 
-	/* Geometry the converter is currently configured for; a change in
-	 * any of these forces a reconfiguration (V4L2 formats cannot change
-	 * while buffers are allocated). */
-	uint32_t src_pixelformat, dst_pixelformat;
-	uint32_t src_width, src_height, src_pitch;
-	uint32_t dst_width, dst_height, dst_pitch;
+	struct vpp_config dst;
+	struct vpp_config src;
 
 	/* Pipeline parameters of the picture being assembled. */
 	struct v4l2r_surface *src_surface;
-	VARectangle src_region;
-	VARectangle dst_region;
 	uint32_t rotation;		/* VA_ROTATION_* */
 	uint32_t mirror;		/* VA_MIRROR_* mask */
 	bool have_params;
