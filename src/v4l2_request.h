@@ -146,6 +146,7 @@ struct v4l2r_config {
 struct v4l2r_surface {
 	struct v4l2r_context *ctx;	/* context the surface is bound to */
 	VASurfaceID id;			/* own VA id, for logging/tracing */
+	pthread_mutex_t mutex;
 	struct v4l2r_surface_vainfo {
 		unsigned int width;
 		unsigned int height;

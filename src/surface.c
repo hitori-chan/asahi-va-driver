@@ -10,9 +10,8 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-#include <errno.h>
 #include <fcntl.h>
-#include <stdlib.h>
+#include <pthread.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -24,7 +23,6 @@
 #include <va/va_drmcommon.h>
 
 #include "v4l2_request.h"
-#include "codec/codec.h"
 
 static void surface_unmap(struct v4l2r_surface *surface)
 {
@@ -79,6 +77,7 @@ VAStatus v4l2r_CreateSurfaces2(VADriverContextP va_ctx, unsigned int format,
 		if (!surface)
 			goto fail;
 
+		pthread_mutex_init(&surface->mutex, NULL);
 		surface->id = id;
 		surface->va.width = width;
 		surface->va.height = height;
@@ -98,8 +97,14 @@ VAStatus v4l2r_CreateSurfaces2(VADriverContextP va_ctx, unsigned int format,
 
 fail:
 	pthread_mutex_lock(&drv->mutex);
-	while (i--)
+	while (i--) {
+		struct v4l2r_surface *surface =
+			V4L2R_SURFACE_GET(drv, surfaces[i]);
+
+		if (surface)
+			pthread_mutex_destroy(&surface->mutex);
 		v4l2r_handles_free(&drv->surfaces, surfaces[i]);
+	}
 	pthread_mutex_unlock(&drv->mutex);
 	return VA_STATUS_ERROR_ALLOCATION_FAILED;
 }
@@ -130,6 +135,7 @@ VAStatus v4l2r_DestroySurfaces(VADriverContextP va_ctx, VASurfaceID *surface_lis
 						      surface->capture_index);
 
 		surface_unmap(surface);
+		pthread_mutex_destroy(&surface->mutex);
 
 		pthread_mutex_lock(&drv->mutex);
 		v4l2r_handles_free(&drv->surfaces, surface_list[i]);
@@ -448,15 +454,22 @@ done:
 }
 
 VAStatus v4l2r_surface_prepare(struct v4l2r_driver *drv,
-			    struct v4l2r_surface *surface, bool need_maps)
+			       struct v4l2r_surface *surface, bool need_maps)
 {
+	VAStatus ret;
+
+	pthread_mutex_lock(&surface->mutex);
 	if (!surface->nb_planes) {
-		if (surface_allocate(drv, surface))
-			return VA_STATUS_ERROR_OPERATION_FAILED;
+		if (surface_allocate(drv, surface)) {
+			ret = VA_STATUS_ERROR_OPERATION_FAILED;
+			goto done;
+		}
 	}
 
-	if (!need_maps)
-		return VA_STATUS_SUCCESS;
+	if (!need_maps) {
+		ret = VA_STATUS_SUCCESS;
+		goto done;
+	}
 
 	for (unsigned int i = 0; i < surface->nb_planes; i++) {
 		if (surface->map[i])
@@ -464,12 +477,18 @@ VAStatus v4l2r_surface_prepare(struct v4l2r_driver *drv,
 		void *addr = mmap(NULL, surface->plane_size[i],
 				  PROT_READ | PROT_WRITE, MAP_SHARED,
 				  surface->dmabuf_fd[i], 0);
-		if (addr == MAP_FAILED)
-			return VA_STATUS_ERROR_OPERATION_FAILED;
+		if (addr == MAP_FAILED) {
+			ret = VA_STATUS_ERROR_OPERATION_FAILED;
+			goto done;
+		}
 		surface->map[i] = addr;
 	}
 
-	return VA_STATUS_SUCCESS;
+	ret = VA_STATUS_SUCCESS;
+
+done:
+	pthread_mutex_unlock(&surface->mutex);
+	return ret;
 }
 
 /*
