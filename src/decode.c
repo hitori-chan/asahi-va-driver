@@ -171,8 +171,11 @@ static int queue_output_buffer(struct v4l2r_context *ctx,
 		.timestamp = output->timestamp,
 		.bytesused = output->bytesused,
 		.request_fd = output->request_fd,
-		.flags = V4L2_BUF_FLAG_REQUEST_FD | flags,
+		.flags = flags,
 	};
+
+	if (!ctx->requestless)
+		buffer.flags |= V4L2_BUF_FLAG_REQUEST_FD;
 
 	return queue_buffer(ctx, &buffer);
 }
@@ -359,6 +362,36 @@ fail:
 }
 
 /*
+ * Request-less queueing reads the controls' current values when a job runs,
+ * so the next S_EXT_CTRLS must wait until every OUTPUT buffer queued so far
+ * is dequeued (its job has run, or for a held H.264 slice been consumed).
+ * An OUTPUT buffer comes back when its job finishes, the same event the
+ * request path waits on, so no thread or request is needed.
+ */
+static int wait_output_idle(struct v4l2r_context *ctx)
+{
+	struct pollfd pollfd = {
+		.fd = ctx->video_fd,
+		.events = POLLOUT,
+	};
+
+	if (ctx->queued_output)
+		dequeue_completed_buffers(ctx, ctx->output_format.type);
+
+	while (ctx->queued_output) {
+		int ret = poll(&pollfd, 1, V4L2R_POLL_TIMEOUT_MS);
+		if (ret <= 0)
+			return -EIO;
+
+		ret = dequeue_buffer(ctx, ctx->output_format.type);
+		if (ret < 0 && ret != -EAGAIN)
+			return ret;
+	}
+
+	return 0;
+}
+
+/*
  * The OUTPUT buffer of the prior use of a request may be dequeued before
  * the request itself has completed (multi stage decoders); wait for the
  * request too before reusing its file descriptor.
@@ -462,7 +495,10 @@ static VAStatus queue_decode(struct v4l2r_context *ctx,
 
 	pthread_mutex_lock(&ctx->mutex);
 
-	ret = wait_on_request(ctx, output);
+	if (ctx->requestless)
+		ret = wait_output_idle(ctx);
+	else
+		ret = wait_on_request(ctx, output);
 	if (ret < 0)
 		goto fail;
 
@@ -513,14 +549,16 @@ static VAStatus queue_decode(struct v4l2r_context *ctx,
 		}
 	}
 
-	if (ioctl(output->request_fd, MEDIA_REQUEST_IOC_QUEUE) < 0) {
-		ret = -errno;
-		v4l2r_log("failed to queue request %d: %s\n",
-			  output->request_fd, strerror(errno));
-		goto fail;
-	}
+	if (!ctx->requestless) {
+		if (ioctl(output->request_fd, MEDIA_REQUEST_IOC_QUEUE) < 0) {
+			ret = -errno;
+			v4l2r_log("failed to queue request %d: %s\n",
+				  output->request_fd, strerror(errno));
+			goto fail;
+		}
 
-	ctx->queued_request |= 1u << output->index;
+		ctx->queued_request |= 1u << output->index;
+	}
 	target->status = VASurfaceRendering;
 
 	pthread_mutex_unlock(&ctx->mutex);

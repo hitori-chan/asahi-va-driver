@@ -22,6 +22,10 @@ blocks the device access this driver needs. Launch Firefox with:
 Note that disabling the RDD sandbox trades away some of the protection
 Firefox normally applies to media decoding.
 
+Without /dev/media* the driver falls back to request-less queueing on the
+AVD's video node; ASAHI_VA_REQUESTLESS=1 forces it (for testing) and the
+init log says "request-less queueing".
+
 
 Building
 --------

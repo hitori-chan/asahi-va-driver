@@ -236,7 +236,8 @@ static int output_buffer_setup(struct v4l2r_context *ctx,
 	output->addr = addr;
 	output->bytesused = 0;
 
-	if (ioctl(ctx->media_fd, MEDIA_IOC_REQUEST_ALLOC, &output->request_fd) < 0) {
+	if (!ctx->requestless &&
+	    ioctl(ctx->media_fd, MEDIA_IOC_REQUEST_ALLOC, &output->request_fd) < 0) {
 		v4l2r_log("failed to allocate request: %s\n", strerror(errno));
 		output->request_fd = -1;
 		return -errno;
@@ -702,13 +703,19 @@ VAStatus v4l2r_CreateContext(VADriverContextP va_ctx, VAConfigID config_id,
 		 * would re-queue the same CAPTURE buffer). */
 		ret = query_buffer_capabilities(ctx, ctx->output_format.type,
 						&ctx->output_capabilities);
-		if (ret < 0 ||
-		    !(ctx->output_capabilities & V4L2_BUF_CAP_SUPPORTS_REQUESTS))
+		ctx->requestless = decoder->requestless;
+		if (ret < 0)
 			goto next;
 
-		ctx->media_fd = open(decoder->media_path, O_RDWR);
-		if (ctx->media_fd < 0)
-			goto next;
+		if (!ctx->requestless) {
+			if (!(ctx->output_capabilities &
+			      V4L2_BUF_CAP_SUPPORTS_REQUESTS))
+				goto next;
+
+			ctx->media_fd = open(decoder->media_path, O_RDWR);
+			if (ctx->media_fd < 0)
+				goto next;
+		}
 
 		/*
 		 * Only accept this decoder if the codec can actually be driven on
@@ -752,9 +759,10 @@ next:
 
 	ctx->decoder = decoder;
 
-	v4l2r_log("decoding %s via %s [%s] (media %s)\n",
+	v4l2r_log("decoding %s via %s [%s] (%s%s)\n",
 		  ctx->codec->name, decoder->video_path, decoder->card,
-		  decoder->media_path);
+		  ctx->requestless ? "request-less" : "media ",
+		  ctx->requestless ? "" : decoder->media_path);
 
 	for (unsigned int i = 0; i < V4L2R_OUTPUT_BUFFERS; i++) {
 		ret = output_buffer_setup(ctx, &ctx->output[i], 0);

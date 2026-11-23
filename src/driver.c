@@ -261,8 +261,14 @@ static int devnode_from_devnum(uint32_t major, uint32_t minor, char *path,
 	return ret;
 }
 
+/*
+ * With requestless set (the media device is out of reach, e.g. in Firefox's
+ * RDD sandbox) accept the AVD stateless decoder, which takes a plain QBUF,
+ * by its driver name instead of probing for request support.
+ */
 static bool video_device_is_request_decoder(const char *path,
-					    struct v4l2r_decoder *decoder)
+					    struct v4l2r_decoder *decoder,
+					    bool requestless)
 {
 	struct v4l2_capability capability = {0};
 	struct v4l2_create_buffers buffers = {0};
@@ -291,13 +297,18 @@ static bool video_device_is_request_decoder(const char *path,
 	else
 		goto fail;
 
-	buffers.memory = V4L2_MEMORY_MMAP;
-	buffers.format.type = output_type;
-	if (ioctl(fd, VIDIOC_CREATE_BUFS, &buffers) < 0)
-		goto fail;
+	if (requestless) {
+		if (strcmp((const char *)capability.driver, "avd"))
+			goto fail;
+	} else {
+		buffers.memory = V4L2_MEMORY_MMAP;
+		buffers.format.type = output_type;
+		if (ioctl(fd, VIDIOC_CREATE_BUFS, &buffers) < 0)
+			goto fail;
 
-	if (!(buffers.capabilities & V4L2_BUF_CAP_SUPPORTS_REQUESTS))
-		goto fail;
+		if (!(buffers.capabilities & V4L2_BUF_CAP_SUPPORTS_REQUESTS))
+			goto fail;
+	}
 
 	/* Collect the coded formats this decoder accepts. */
 	decoder->nb_pixelformats = 0;
@@ -354,7 +365,7 @@ static void probe_media_device(struct v4l2r_driver *drv, const char *media_path)
 					video_path, sizeof(video_path)) < 0)
 			continue;
 
-		if (!video_device_is_request_decoder(video_path, decoder))
+		if (!video_device_is_request_decoder(video_path, decoder, false))
 			continue;
 
 		snprintf(decoder->media_path, sizeof(decoder->media_path),
@@ -372,24 +383,57 @@ done:
 	close(media_fd);
 }
 
+/* Request-less fallback: scan the video nodes for the AVD, no media device
+ * and no sysfs needed. */
+static void probe_video_devices(struct v4l2r_driver *drv)
+{
+	for (int i = 0; i < 64 && drv->nb_decoders < V4L2R_MAX_DECODERS; i++) {
+		struct v4l2r_decoder *decoder = &drv->decoders[drv->nb_decoders];
+		char video_path[32];
+
+		snprintf(video_path, sizeof(video_path), "/dev/video%d", i);
+		if (access(video_path, F_OK) < 0)
+			continue;
+
+		if (!video_device_is_request_decoder(video_path, decoder, true))
+			continue;
+
+		decoder->requestless = true;
+		decoder->media_path[0] = '\0';
+		snprintf(decoder->video_path, sizeof(decoder->video_path),
+			 "%s", video_path);
+		drv->nb_decoders++;
+	}
+}
+
 static void enumerate_decoders(struct v4l2r_driver *drv)
 {
 	const char *env_media = getenv("LIBVA_V4L2_REQUEST_MEDIA_PATH");
+	const char *env_rl = getenv("ASAHI_VA_REQUESTLESS");
 
-	if (env_media) {
-		probe_media_device(drv, env_media);
+	/* ASAHI_VA_REQUESTLESS=1 forces the fallback so it can be tested
+	 * outside the sandbox. */
+	if (env_rl && *env_rl && strcmp(env_rl, "0")) {
+		probe_video_devices(drv);
 		return;
 	}
 
-	for (int i = 0; i < 64 && drv->nb_decoders < V4L2R_MAX_DECODERS; i++) {
-		char media_path[32];
+	if (env_media) {
+		probe_media_device(drv, env_media);
+	} else {
+		for (int i = 0; i < 64 && drv->nb_decoders < V4L2R_MAX_DECODERS; i++) {
+			char media_path[32];
 
-		snprintf(media_path, sizeof(media_path), "/dev/media%d", i);
-		if (access(media_path, F_OK) < 0)
-			continue;
+			snprintf(media_path, sizeof(media_path), "/dev/media%d", i);
+			if (access(media_path, F_OK) < 0)
+				continue;
 
-		probe_media_device(drv, media_path);
+			probe_media_device(drv, media_path);
+		}
 	}
+
+	if (!drv->nb_decoders)
+		probe_video_devices(drv);
 }
 
 /* A usable format converter is a plain (non-request) mem2mem device */
@@ -864,7 +908,12 @@ VAStatus V4L2R_DRIVER_INIT(VADriverContextP va_ctx)
 
 	enumerate_converters(drv);
 
-	v4l2r_log("detected %u Request API decoder%s\n", drv->nb_decoders,
+	if (drv->decoders[0].requestless)
+		v4l2r_log("request-less queueing on %s (no usable media device)\n",
+			  drv->decoders[0].video_path);
+
+	v4l2r_log("detected %u %s decoder%s\n", drv->nb_decoders,
+		  drv->decoders[0].requestless ? "request-less" : "Request API",
 		  drv->nb_decoders == 1 ? "" : "s");
 
 	return VA_STATUS_SUCCESS;

@@ -88,6 +88,7 @@ void v4l2r_trace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
  * device it hangs off and the coded (OUTPUT queue) pixelformats it accepts.
  */
 struct v4l2r_decoder {
+	bool requestless;	/* no media device: plain QBUF on the video node */
 	char media_path[256];
 	char video_path[256];
 	char card[32];
@@ -284,6 +285,7 @@ struct v4l2r_context {
 
 	int video_fd;
 	int media_fd;
+	bool requestless;	/* decoder->requestless, see queue_decode() */
 
 	unsigned int picture_width;
 	unsigned int picture_height;
